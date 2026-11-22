@@ -50,7 +50,10 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
   if (path.length === 0) return problem('Not found.', 'route_not_found', 404);
 
   const slash = NO_TRAILING_SLASH.has(path.join('/')) ? '' : '/';
-  const url = `${BACKEND}/api/${path.map(encodeURIComponent).join('/')}${slash}${req.nextUrl.search}`;
+  // Remove 'rydnow' — keep everything after it
+  const [_, ...rest] = path;
+  const url = `${BACKEND}/api/${rest.map(encodeURIComponent).join('/')}${slash}${req.nextUrl.search}`;
+
 
   const headers = new Headers();
   for (const name of FORWARDED_REQUEST_HEADERS) {
