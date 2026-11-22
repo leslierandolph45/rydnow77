@@ -58,7 +58,7 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
 
   // FIX: do NOT drop the first segment. "rydnow" is already consumed by the folder name.
   // Only strip it if it somehow appears again (Django has no URL that starts with "rydnow").
-  const rest = path[0] === 'rydnow' ? path.slice(1) : path;
+  const rest = (path[0] === 'rydnow' ? path.slice(1) : path).filter(Boolean);
   console.log('DEBUG: full path=', path, '→ rest=', rest);
   if (rest.length === 0) return problem('Not found.', 'route_not_found', 404);
 
