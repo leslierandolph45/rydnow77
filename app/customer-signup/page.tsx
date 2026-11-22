@@ -16,7 +16,7 @@ const REQUEST_TIMEOUT_MS = 60000;
 
 // FIX: these two were used but never defined (ReferenceError after a successful signup).
 const LOGIN_ROUTE = '/login';
-const DASHBOARD_ROUTE = '/dashboard'; // <- change if your customer dashboard lives at another path
+const DASHBOARD_ROUTE = '/customer-dashboard'; // <- change if your customer dashboard lives at another path
 
 const BRAND = {
   navy: '#0A2342',
