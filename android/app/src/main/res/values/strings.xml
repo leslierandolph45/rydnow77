@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">RYDNOW</string>
+    <string name="title_activity_main">RYDNOW</string>
+    <string name="package_name">com.rydnow.app</string>
+    <string name="custom_url_scheme">com.rydnow.app</string>
+</resources>
