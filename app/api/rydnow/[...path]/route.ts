@@ -1,36 +1,16 @@
 /**
  * app/api/rydnow/[...path]/route.ts
  *
- * Server-side proxy between the browser and the Django backend:
+ *   browser -> /api/rydnow/<path> -> this file -> <RYDNOW_API_URL>/api/<path>
  *
- *   browser  ->  /api/rydnow/<path>  ->  this file  ->  <RYDNOW_API_URL>/api/<path>
- *
- * IMPORTANT: "rydnow" is a real folder in app/api/rydnow/, so Next.js already strips it.
- * `params.path` holds only what comes AFTER it:
- *   /api/rydnow/auth/register/customer/  ->  path = ["auth", "register", "customer"]
- *   forwarded to  <RYDNOW_API_URL>/api/auth/register/customer/
- *
- * (The old version did `const [, ...rest] = path`, which threw away "auth" and sent
- *  /api/register/customer/ to Django = 404.)
- *
- * As a safety net, a leading "rydnow" segment is removed if it ever shows up
- * (for example if this file is moved to app/api/[...path]/route.ts).
- *
- * Env (set in .env.local and in Vercel; restart `next dev` after changing it):
- *   RYDNOW_API_URL=https://rydnow-backend.onrender.com   (NO "/api" at the end; a trailing
- *                                                         "/api" is tolerated and removed)
- *
- * Trailing slashes
- * ----------------
- * Django routes end with "/" (APPEND_SLASH), and a redirected POST loses its body. Next.js strips
- * trailing slashes from incoming URLs by default, so this proxy always puts the slash back when it
- * calls Django. The one route Django serves WITHOUT a slash is customer/wallet.
+ * Diagnostics (remove once signup works):
+ *   GET /api/rydnow/_debug      -> shows which backend URL this deployment is using
+ *   Any upstream 404            -> returned as JSON with the exact target URL and a snippet of the body
  */
 import { NextResponse, type NextRequest } from 'next/server';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-/** A sleeping Render instance can take a while to answer the first call. */
 export const maxDuration = 60;
 
 const DEFAULT_BACKEND = 'https://rydnow-backend.onrender.com';
@@ -39,12 +19,8 @@ const BACKEND = (process.env.RYDNOW_API_URL || DEFAULT_BACKEND).trim().replace(/
 /** Paths (after /api/) that Django serves without a trailing slash. */
 const NO_TRAILING_SLASH = new Set(['customer/wallet']);
 
-/** Only these request headers are forwarded to the backend. */
 const FORWARDED_REQUEST_HEADERS = ['authorization', 'content-type', 'accept', 'accept-language', 'idempotency-key'] as const;
-
-/** Only these response headers are returned to the browser. */
 const FORWARDED_RESPONSE_HEADERS = ['content-type', 'retry-after'] as const;
-
 const UPSTREAM_TIMEOUT_MS = 55_000;
 
 interface RouteContext {
@@ -55,13 +31,17 @@ const problem = (detail: string, code: string, status: number) => NextResponse.j
 
 async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
   const { path = [] } = await ctx.params;
-
-  // FIX: do NOT drop the first segment. "rydnow" is already consumed by the folder name.
-  // Only strip it if it somehow appears again (Django has no URL that starts with "rydnow").
   const rest = (path[0] === 'rydnow' ? path.slice(1) : path).filter(Boolean);
-  console.log('DEBUG: full path=', path, '→ rest=', rest);
-  if (rest.length === 0) return problem('Not found.', 'route_not_found', 404);
 
+  if (rest[0] === '_debug') {
+    return NextResponse.json({
+      backend: BACKEND,
+      env_set: Boolean(process.env.RYDNOW_API_URL),
+      example_target: `${BACKEND}/api/auth/register/customer/`,
+    });
+  }
+
+  if (rest.length === 0) return problem('Not found.', 'route_not_found', 404);
 
   const slash = NO_TRAILING_SLASH.has(rest.join('/')) ? '' : '/';
   const url = `${BACKEND}/api/${rest.map(encodeURIComponent).join('/')}${slash}${req.nextUrl.search}`;
@@ -91,10 +71,27 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
       : problem('The server could not be reached.', 'upstream_unreachable', 502);
   }
 
-  // The backend should never redirect (slashes are added above). A redirect here means a
-  // misconfigured URL, and following it could silently turn a POST into a GET.
   if (upstream.status >= 300 && upstream.status < 400) {
     return problem('Unexpected redirect from the server.', 'upstream_redirect', 502);
+  }
+
+  const body = upstream.status === 204 || upstream.status === 205 ? null : await upstream.arrayBuffer();
+
+  // DIAGNOSTIC: show exactly where the 404 came from.
+  if (upstream.status === 404) {
+    const snippet = body ? new TextDecoder().decode(body).slice(0, 300) : '';
+    return NextResponse.json(
+      {
+        detail: 'Upstream 404',
+        code: 'upstream_404',
+        target: url,
+        method: req.method,
+        upstream_content_type: upstream.headers.get('content-type'),
+        upstream_render_routing: upstream.headers.get('x-render-routing'),
+        upstream_body: snippet,
+      },
+      { status: 404 },
+    );
   }
 
   const responseHeaders = new Headers({ 'cache-control': 'no-store' });
@@ -102,12 +99,7 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
     const value = upstream.headers.get(name);
     if (value) responseHeaders.set(name, value);
   }
-
-  const emptyBody = upstream.status === 204 || upstream.status === 205;
-  return new Response(emptyBody ? null : await upstream.arrayBuffer(), {
-    status: upstream.status,
-    headers: responseHeaders,
-  });
+  return new Response(body, { status: upstream.status, headers: responseHeaders });
 }
 
 export const GET = proxy;
@@ -115,3 +107,4 @@ export const POST = proxy;
 export const PUT = proxy;
 export const PATCH = proxy;
 export const DELETE = proxy;
+
