@@ -5,6 +5,9 @@
  *
  *   browser  ->  /api/rydnow/<path>  ->  this file  ->  <RYDNOW_API_URL>/api/<path>
  *
+ * The leading "rydnow" segment is dropped: Django's URLs have no "/rydnow" in them.
+ *   /api/rydnow/booking/calculate-price/  ->  <RYDNOW_API_URL>/api/booking/calculate-price/
+ *
  * The browser only ever talks to its own origin, so there are no CORS problems and the backend
  * address stays out of client code.
  *
@@ -47,13 +50,13 @@ const problem = (detail: string, code: string, status: number) => NextResponse.j
 
 async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
   const { path = [] } = await ctx.params;
-  if (path.length === 0) return problem('Not found.', 'route_not_found', 404);
 
-  const slash = NO_TRAILING_SLASH.has(path.join('/')) ? '' : '/';
-  // Remove 'rydnow' — keep everything after it
-  const [_, ...rest] = path;
+  // Drop the leading "rydnow" segment; Django's URLs start right after /api/.
+  const [, ...rest] = path;
+  if (rest.length === 0) return problem('Not found.', 'route_not_found', 404);
+
+  const slash = NO_TRAILING_SLASH.has(rest.join('/')) ? '' : '/';
   const url = `${BACKEND}/api/${rest.map(encodeURIComponent).join('/')}${slash}${req.nextUrl.search}`;
-
 
   const headers = new Headers();
   for (const name of FORWARDED_REQUEST_HEADERS) {
@@ -104,4 +107,5 @@ export const POST = proxy;
 export const PUT = proxy;
 export const PATCH = proxy;
 export const DELETE = proxy;
+
 
