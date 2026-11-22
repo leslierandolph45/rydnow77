@@ -78,6 +78,8 @@ export const ROUTES = {
   bookingRelease: (ref: string) => `booking/${seg(ref)}/release/`, // POST
   revenueReport: "booking/admin/revenue/", // GET   staff only
   nearbyRiders: "dispatch/rider/nearby/", // GET   NearbyRidersView
+  //after 
+  nearbyRiders: "rider/nearby", // GET NearbyRidersView
   // booking/webhook/ is provider-to-server only and is intentionally not here.
 
   // ---- api/urls.py: auth ---------------------------------------------------
