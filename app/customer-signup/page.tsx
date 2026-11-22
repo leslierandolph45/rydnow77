@@ -5,18 +5,18 @@ import type { ChangeEvent, FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 
-// FIX: always call the Next.js proxy (same origin), never the Render URL directly.
-//   browser -> /api/rydnow/auth/register/customer/ -> proxy -> https://rydnow-backend.onrender.com/api/auth/register/customer/
-// The old code read NEXT_PUBLIC_API_BASE (which is "/api/rydnow" for lib/rydnow/api.ts) and
-// built ".../api/rydnow/api/auth/..." = 404.
-const API_BASE = '/api/rydnow'; 
-const REGISTER_URL = `${API_BASE}/auth/register/customer/`;
-const LOGIN_URL = `${API_BASE}/auth/login/`;
+// Browser -> /api/rydnow/<path> -> Next.js proxy -> https://rydnow-backend.onrender.com/api/<path>
+// Base has NO trailing slash and api() below strips stray slashes, so "//" can never appear.
+const API_BASE = '/api/rydnow';
+const api = (path: string) => `${API_BASE}/${path.replace(/^\/+/, '')}`;
+
+// Tried in order. Only a 404 moves on to the next one.
+const REGISTER_PATHS = ['auth/register/customer/', 'auth/register/', 'register/customer/'];
+const LOGIN_PATHS = ['auth/login/', 'auth/token/'];
 const REQUEST_TIMEOUT_MS = 60000;
 
-// FIX: these two were used but never defined (ReferenceError after a successful signup).
 const LOGIN_ROUTE = '/login';
-const DASHBOARD_ROUTE = '/customer-dashboard/'; // <- change if your customer dashboard lives at another path
+const DASHBOARD_ROUTE = '/customer-dashboard/'; // change if your dashboard lives elsewhere
 
 const BRAND = {
   navy: '#0A2342',
@@ -35,8 +35,6 @@ const isValidGhanaNumber = (phone: string) => {
   return false;
 };
 
-// Always send the international format (+233...), which phone-number fields
-// on the backend accept without needing a default region.
 const toInternational = (phone: string) => {
   const cleaned = phone.replace(/[\s-]/g, '');
   if (cleaned.startsWith('+233')) return cleaned;
@@ -44,14 +42,12 @@ const toInternational = (phone: string) => {
   return `+233${cleaned}`;
 };
 
-// Backend may return a string or an array of strings per field.
 const firstMessage = (v: unknown): string | null => {
   if (Array.isArray(v)) return v.length ? String(v[0]) : null;
   if (typeof v === 'string' && v) return v;
   return null;
 };
 
-// Writes the session exactly like the login page does, token first.
 const saveSession = (token: string, user: Record<string, unknown>) => {
   const entries: [string, string][] = [
     ['rydnow_token', token],
@@ -68,6 +64,35 @@ const saveSession = (token: string, user: Record<string, unknown>) => {
     }
   }
 };
+
+/**
+ * POST JSON to the first path that exists. A 404 means "no such route", so the next path is tried.
+ * Any other status (200, 400, 401, 500...) is returned immediately.
+ * Logs the exact URL and body of every 404 so the real cause is visible in the console.
+ */
+async function postFirstMatch(paths: string[], body: unknown, signal: AbortSignal) {
+  let last: { res: Response; data: any; url: string } | null = null;
+  for (const path of paths) {
+    const url = api(path);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    });
+    const text = await res.text();
+    let data: any = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch {
+      data = { _nonJson: text.slice(0, 200) };
+    }
+    last = { res, data, url };
+    if (res.status !== 404) return last;
+    console.error(`[rydnow] 404 from ${url}`, data);
+  }
+  return last!;
+}
 
 // ─── SMALL UI PIECES ─────────────────────────────────────────────
 const stroke = {
@@ -122,7 +147,7 @@ const icons = {
   check: (
     <>
       <circle cx="12" cy="12" r="10" />
-      <path d="m8 12.5 2.8 2.8L16 9.800" />
+      <path d="m8 12.5 2.8 2.8L16 9.8" />
     </>
   ),
 } as const;
@@ -163,9 +188,7 @@ function Field({
   return (
     <label className="block">
       <span className="mb-1.5 block text-sm font-semibold text-slate-200">{label}</span>
-      <span
-        className="flex items-center gap-3 rounded-xl border border-slate-600/70 bg-[#13294B] px-4 transition focus-within:border-[#3B82F6] focus-within:ring-4 focus-within:ring-[#3B82F6]/25"
-      >
+      <span className="flex items-center gap-3 rounded-xl border border-slate-600/70 bg-[#13294B] px-4 transition focus-within:border-[#3B82F6] focus-within:ring-4 focus-within:ring-[#3B82F6]/25">
         <span className="text-slate-400">
           <Icon name={icon} />
         </span>
@@ -196,7 +219,6 @@ export default function CustomerSignupPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
-  // Typing in ANY field (including Password / Confirm Password) clears the error.
   const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
     setFormData((prev) => ({ ...prev, [e.target.name]: e.target.value }));
     setError('');
@@ -204,7 +226,7 @@ export default function CustomerSignupPage() {
 
   const handleSubmitForm = async (e: FormEvent) => {
     e.preventDefault();
-    if (loading || successMsg) return; // block double submits
+    if (loading || successMsg) return;
     setError('');
     setSuccessMsg('');
 
@@ -216,7 +238,6 @@ export default function CustomerSignupPage() {
       setError('Your password needs at least 10 characters.');
       return;
     }
-    // Checked BEFORE the API call: a mismatch never reaches the server.
     if (formData.password !== formData.confirmPassword) {
       setError('Passwords do not match');
       return;
@@ -226,46 +247,36 @@ export default function CustomerSignupPage() {
 
     const finalPhone = toInternational(formData.phone);
     const email = formData.email.trim().toLowerCase();
-
-    // Built from the FULL email (not just the part before "@") so two people like
-    // john@gmail.com and john@yahoo.com never end up with the same username.
-    // Only used as a second login attempt if signing in with the email fails.
     const derivedUsername = email.replace(/[^a-z0-9]/g, '_').slice(0, 150);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      const res = await fetch(REGISTER_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-        },
-        body: JSON.stringify({
+      const { res, data: result, url } = await postFirstMatch(
+        REGISTER_PATHS,
+        {
           full_name: formData.fullName.trim(),
-          email, // same trimmed + lowercased value the login fallback uses
+          email,
           phone: finalPhone,
           password: formData.password,
-        }),
-        signal: controller.signal,
-      });
-
-      // Read the body once; tolerate non-JSON error pages.
-      const result: any = await res.json().catch(() => ({}));
+        },
+        controller.signal,
+      );
 
       if (!res.ok) {
-        // A 404 means the URL does not exist on the backend. Say so clearly
-        // instead of showing a vague message, and log the exact URL called.
         if (res.status === 404) {
-          console.error('Signup endpoint returned 404:', REGISTER_URL);
-          setError('Sign-up is temporarily unavailable. Please try again shortly.');
+          // Every candidate path returned 404: the route is missing on the backend (or the
+          // backend is not the latest deploy). The console shows each URL that was tried.
+          console.error('Signup: all register paths returned 404. Last URL:', url, 'Body:', result);
+          setError(
+            'Sign-up is not available right now (server route not found). Please contact support if this continues.',
+          );
           return;
         }
 
         console.error('Signup response', res.status, result);
 
-        // DRF can return {errors: {...}}, or the field errors directly: {email: [...]}
         const errs = result?.errors || result || {};
         const message =
           firstMessage(errs.email) ||
@@ -282,25 +293,22 @@ export default function CustomerSignupPage() {
         throw new Error(message);
       }
 
-      // 1) Find a token in the sign-up response.
+      // 1) Token in the sign-up response?
       let token: unknown =
         result?.token ?? result?.key ?? result?.access ?? result?.tokens?.access ?? result?.data?.token;
       const backendUser: Record<string, unknown> =
         result?.user && typeof result.user === 'object' ? result.user : {};
       let loginIdentifier = email;
 
-      // 2) If sign-up did not return a token, sign in with the same credentials.
-      //    Tries the email first, then the username derived from it.
+      // 2) Otherwise sign in with the same credentials (email first, then derived username).
       if (!token) {
         for (const identifier of [email, derivedUsername]) {
           try {
-            const loginRes = await fetch(LOGIN_URL, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-              body: JSON.stringify({ username: identifier, password: formData.password }),
-              signal: controller.signal,
-            });
-            const loginData: any = await loginRes.json().catch(() => ({}));
+            const { res: loginRes, data: loginData } = await postFirstMatch(
+              LOGIN_PATHS,
+              { username: identifier, password: formData.password },
+              controller.signal,
+            );
             if (loginRes.ok) {
               token = loginData?.token ?? loginData?.key ?? loginData?.access;
               if (token) {
@@ -312,13 +320,11 @@ export default function CustomerSignupPage() {
             }
           } catch (loginErr) {
             if (loginErr instanceof DOMException && loginErr.name === 'AbortError') throw loginErr;
-            /* otherwise try the next identifier */
           }
         }
       }
 
-      // 3) Still no token: do NOT send the user to the dashboard (it would
-      //    bounce them straight back out). Send them to the login page instead.
+      // 3) Still no token: send them to the login page.
       if (!token) {
         setSuccessMsg('Account created successfully! Please sign in to continue.');
         setTimeout(() => router.push(LOGIN_ROUTE), 1500);
@@ -352,7 +358,6 @@ export default function CustomerSignupPage() {
     }
   };
 
-  // Simple 3-step password meter
   const pwScore =
     (formData.password.length >= 6 ? 1 : 0) +
     (formData.password.length >= 10 ? 1 : 0) +
@@ -400,7 +405,6 @@ export default function CustomerSignupPage() {
               Book rides and send parcels across Ghana in minutes.
             </p>
           </div>
-          {/* vector: phone + pin */}
           <svg viewBox="0 0 120 120" className="h-[clamp(4.5rem,22vw,6rem)] w-[clamp(4.5rem,22vw,6rem)] shrink-0" aria-hidden>
             <circle cx="60" cy="60" r="56" fill={BRAND.blue} opacity="0.25" />
             <rect x="36" y="18" width="48" height="84" rx="9" fill={BRAND.navy} stroke={BRAND.sky} strokeWidth="3" />
