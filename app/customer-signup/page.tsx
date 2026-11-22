@@ -9,15 +9,13 @@ import Link from 'next/link';
 
 // Strip trailing slashes and an accidental trailing "/api" so the final URL
 // can never become ".../api/api/auth/..." (a classic cause of 404).
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || 'https://rydnow-backend.onrender.com')
+const API_ORIGIN = (process.env.NEXT_PUBLIC_API_BASE || 'https://rydnow-backend.onrender.com')
   .trim()
   .replace(/\/+$/, '')
   .replace(/\/api$/, '');
+const API_BASE = `${API_ORIGIN}/api`;
 const REGISTER_URL = `${API_BASE}/auth/register/customer/`;
 const LOGIN_URL = `${API_BASE}/auth/login/`;
-// Must match the real folder of your dashboard page: app/customer-dashboard/page.tsx
-const DASHBOARD_ROUTE = '/customer-dashboard/';
-const LOGIN_ROUTE = '/login';
 const REQUEST_TIMEOUT_MS = 60000;
 
 
