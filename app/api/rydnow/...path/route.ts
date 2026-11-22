@@ -5,15 +5,20 @@
  *
  *   browser  ->  /api/rydnow/<path>  ->  this file  ->  <RYDNOW_API_URL>/api/<path>
  *
- * The leading "rydnow" segment is dropped: Django's URLs have no "/rydnow" in them.
- *   /api/rydnow/booking/calculate-price/  ->  <RYDNOW_API_URL>/api/booking/calculate-price/
+ * IMPORTANT: "rydnow" is a real folder in app/api/rydnow/, so Next.js already strips it.
+ * `params.path` holds only what comes AFTER it:
+ *   /api/rydnow/auth/register/customer/  ->  path = ["auth", "register", "customer"]
+ *   forwarded to  <RYDNOW_API_URL>/api/auth/register/customer/
  *
- * The browser only ever talks to its own origin, so there are no CORS problems and the backend
- * address stays out of client code.
+ * (The old version did `const [, ...rest] = path`, which threw away "auth" and sent
+ *  /api/register/customer/ to Django = 404.)
+ *
+ * As a safety net, a leading "rydnow" segment is removed if it ever shows up
+ * (for example if this file is moved to app/api/[...path]/route.ts).
  *
  * Env (set in .env.local and in Vercel; restart `next dev` after changing it):
- *   RYDNOW_API_URL=https://rydnow-backend.onrender.com     (NO "/api" at the end; a trailing
- *                                                           "/api" is tolerated and removed)
+ *   RYDNOW_API_URL=https://rydnow-backend.onrender.com   (NO "/api" at the end; a trailing
+ *                                                         "/api" is tolerated and removed)
  *
  * Trailing slashes
  * ----------------
@@ -29,7 +34,7 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
 const DEFAULT_BACKEND = 'https://rydnow-backend.onrender.com';
-const BACKEND = (process.env.RYDNOW_API_URL || DEFAULT_BACKEND).replace(/\/+$/, '').replace(/\/api$/, '');
+const BACKEND = (process.env.RYDNOW_API_URL || DEFAULT_BACKEND).trim().replace(/\/+$/, '').replace(/\/api$/, '');
 
 /** Paths (after /api/) that Django serves without a trailing slash. */
 const NO_TRAILING_SLASH = new Set(['customer/wallet']);
@@ -51,8 +56,9 @@ const problem = (detail: string, code: string, status: number) => NextResponse.j
 async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
   const { path = [] } = await ctx.params;
 
-  // Drop the leading "rydnow" segment; Django's URLs start right after /api/.
-  const [, ...rest] = path;
+  // FIX: do NOT drop the first segment. "rydnow" is already consumed by the folder name.
+  // Only strip it if it somehow appears again (Django has no URL that starts with "rydnow").
+  const rest = path[0] === 'rydnow' ? path.slice(1) : path;
   if (rest.length === 0) return problem('Not found.', 'route_not_found', 404);
 
   const slash = NO_TRAILING_SLASH.has(rest.join('/')) ? '' : '/';
@@ -107,5 +113,3 @@ export const POST = proxy;
 export const PUT = proxy;
 export const PATCH = proxy;
 export const DELETE = proxy;
-
-

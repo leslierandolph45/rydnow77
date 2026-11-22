@@ -213,6 +213,7 @@ const PAY_HINT: Record<PaymentMethod, string> = {
 
 /** Pure helpers. No React, no browser-only globals at import time. */
 
+// FIX: template literals had lost their "${ }" and printed raw text.
 const uid = () =>
   typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 

@@ -46,7 +46,13 @@ export type Quote = QuoteResponse;
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-export const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || API_BASE_DEFAULT).replace(/\/+$/, "");
+/**
+ * The browser must ALWAYS talk to the Next.js proxy (/api/rydnow), never straight to Django.
+ * If NEXT_PUBLIC_API_BASE is set to a full backend URL by mistake, requests would skip the
+ * proxy (and its trailing-slash handling), so only a same-origin path is accepted.
+ */
+const rawBase = (process.env.NEXT_PUBLIC_API_BASE || "").trim();
+export const API_BASE = (rawBase.startsWith("/") ? rawBase : API_BASE_DEFAULT).replace(/\/+$/, "");
 
 const TOKEN_KEY = process.env.NEXT_PUBLIC_RYDNOW_TOKEN_KEY ?? "rydnow_token";
 
@@ -77,9 +83,7 @@ export const ROUTES = {
   bookingCancel: (ref: string) => `booking/${seg(ref)}/cancel/`, // POST
   bookingRelease: (ref: string) => `booking/${seg(ref)}/release/`, // POST
   revenueReport: "booking/admin/revenue/", // GET   staff only
-  nearbyRiders: "dispatch/rider/nearby/", // GET   NearbyRidersView
-  //after 
-  nearbyRiders: "rider/nearby", // GET NearbyRidersView
+  nearbyRiders: "dispatch/rider/nearby/", // GET   NearbyRidersView  (FIX: duplicate "rider/nearby" key removed)
   // booking/webhook/ is provider-to-server only and is intentionally not here.
 
   // ---- api/urls.py: auth ---------------------------------------------------
@@ -93,6 +97,9 @@ export const ROUTES = {
   riderVerificationStatus: "auth/rider/verification-status/", // GET
   me: "auth/me/", // GET, PATCH
   customerProfile: "profile/", // GET, PATCH
+
+  // ---- api/urls.py: health -------------------------------------------------
+  health: "health/", // GET   {"status": "ok"}
 
   // ---- api/urls.py: rider --------------------------------------------------
   offerAccept: (id: string) => `rider/offers/${seg(id)}/accept/`, // POST
@@ -870,6 +877,9 @@ export function quoteSecondsLeft(quote: Pick<QuoteResponse, "valid_until">, now:
 // 6. ENDPOINTS
 // ===========================================================================
 export const api = {
+  // ---- health check (use it to tell "proxy/backend unreachable" from "route missing") ----
+  health: () => get<{ status: string }>(ROUTES.health, undefined, { auth: false }),
+
   // ---- pricing + bookings ------------------------------------------------
   booking: {
     /** POST booking/calculate-price/. Anonymous callers get an estimate with quote_token = null.

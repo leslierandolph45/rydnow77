@@ -1,23 +1,22 @@
 'use client';
 
-
 import { useState, ReactNode } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 
-
-// Strip trailing slashes and an accidental trailing "/api" so the final URL
-// can never become ".../api/api/auth/..." (a classic cause of 404).
-const API_ORIGIN = (process.env.NEXT_PUBLIC_API_BASE || 'https://rydnow-backend.onrender.com')
-  .trim()
-  .replace(/\/+$/, '')
-  .replace(/\/api$/, '');
-const API_BASE = `${API_ORIGIN}/api`;
+// FIX: always call the Next.js proxy (same origin), never the Render URL directly.
+//   browser -> /api/rydnow/auth/register/customer/ -> proxy -> https://rydnow-backend.onrender.com/api/auth/register/customer/
+// The old code read NEXT_PUBLIC_API_BASE (which is "/api/rydnow" for lib/rydnow/api.ts) and
+// built ".../api/rydnow/api/auth/..." = 404.
+const API_BASE = '/api/rydnow';
 const REGISTER_URL = `${API_BASE}/auth/register/customer/`;
 const LOGIN_URL = `${API_BASE}/auth/login/`;
 const REQUEST_TIMEOUT_MS = 60000;
 
+// FIX: these two were used but never defined (ReferenceError after a successful signup).
+const LOGIN_ROUTE = '/login';
+const DASHBOARD_ROUTE = '/dashboard'; // <- change if your customer dashboard lives at another path
 
 const BRAND = {
   navy: '#0A2342',
@@ -28,7 +27,6 @@ const BRAND = {
   success: '#10B981',
 } as const;
 
-
 const isValidGhanaNumber = (phone: string) => {
   const cleaned = phone.replace(/[\s-]/g, '');
   if (/^0[2-9]\d{8}$/.test(cleaned)) return true;
@@ -36,7 +34,6 @@ const isValidGhanaNumber = (phone: string) => {
   if (/^[2-9]\d{8}$/.test(cleaned)) return true;
   return false;
 };
-
 
 // Always send the international format (+233...), which phone-number fields
 // on the backend accept without needing a default region.
@@ -47,14 +44,12 @@ const toInternational = (phone: string) => {
   return `+233${cleaned}`;
 };
 
-
 // Backend may return a string or an array of strings per field.
 const firstMessage = (v: unknown): string | null => {
   if (Array.isArray(v)) return v.length ? String(v[0]) : null;
   if (typeof v === 'string' && v) return v;
   return null;
 };
-
 
 // Writes the session exactly like the login page does, token first.
 const saveSession = (token: string, user: Record<string, unknown>) => {
@@ -74,7 +69,6 @@ const saveSession = (token: string, user: Record<string, unknown>) => {
   }
 };
 
-
 // ─── SMALL UI PIECES ─────────────────────────────────────────────
 const stroke = {
   fill: 'none',
@@ -83,7 +77,6 @@ const stroke = {
   strokeLinecap: 'round' as const,
   strokeLinejoin: 'round' as const,
 };
-
 
 const icons = {
   user: (
@@ -134,7 +127,6 @@ const icons = {
   ),
 } as const;
 
-
 function Icon({ name, className = 'h-5 w-5' }: { name: keyof typeof icons; className?: string }) {
   return (
     <svg viewBox="0 0 24 24" className={className} {...stroke} aria-hidden>
@@ -142,7 +134,6 @@ function Icon({ name, className = 'h-5 w-5' }: { name: keyof typeof icons; class
     </svg>
   );
 }
-
 
 function Logo() {
   return (
@@ -155,7 +146,6 @@ function Logo() {
     </span>
   );
 }
-
 
 function Field({
   label,
@@ -187,10 +177,8 @@ function Field({
   );
 }
 
-
 const inputCls =
   'w-full min-w-0 bg-transparent py-3.5 text-base text-white placeholder:text-slate-500 focus:outline-none';
-
 
 // ─── PAGE ────────────────────────────────────────────────────────
 export default function CustomerSignupPage() {
@@ -208,20 +196,17 @@ export default function CustomerSignupPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
 
-
   // Typing in ANY field (including Password / Confirm Password) clears the error.
   const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
     setFormData((prev) => ({ ...prev, [e.target.name]: e.target.value }));
     setError('');
   };
 
-
   const handleSubmitForm = async (e: FormEvent) => {
     e.preventDefault();
     if (loading || successMsg) return; // block double submits
     setError('');
     setSuccessMsg('');
-
 
     if (!isValidGhanaNumber(formData.phone)) {
       setError('Enter a valid Ghanaian number, e.g. 0241234567 or +233241234567.');
@@ -237,23 +222,18 @@ export default function CustomerSignupPage() {
       return;
     }
 
-
     setLoading(true);
-
 
     const finalPhone = toInternational(formData.phone);
     const email = formData.email.trim().toLowerCase();
-
 
     // Built from the FULL email (not just the part before "@") so two people like
     // john@gmail.com and john@yahoo.com never end up with the same username.
     // Only used as a second login attempt if signing in with the email fails.
     const derivedUsername = email.replace(/[^a-z0-9]/g, '_').slice(0, 150);
 
-
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
 
     try {
       const res = await fetch(REGISTER_URL, {
@@ -271,10 +251,8 @@ export default function CustomerSignupPage() {
         signal: controller.signal,
       });
 
-
       // Read the body once; tolerate non-JSON error pages.
       const result: any = await res.json().catch(() => ({}));
-
 
       if (!res.ok) {
         // A 404 means the URL does not exist on the backend. Say so clearly
@@ -285,9 +263,7 @@ export default function CustomerSignupPage() {
           return;
         }
 
-
         console.error('Signup response', res.status, result);
-
 
         // DRF can return {errors: {...}}, or the field errors directly: {email: [...]}
         const errs = result?.errors || result || {};
@@ -306,14 +282,12 @@ export default function CustomerSignupPage() {
         throw new Error(message);
       }
 
-
       // 1) Find a token in the sign-up response.
       let token: unknown =
         result?.token ?? result?.key ?? result?.access ?? result?.tokens?.access ?? result?.data?.token;
       const backendUser: Record<string, unknown> =
         result?.user && typeof result.user === 'object' ? result.user : {};
       let loginIdentifier = email;
-
 
       // 2) If sign-up did not return a token, sign in with the same credentials.
       //    Tries the email first, then the username derived from it.
@@ -343,7 +317,6 @@ export default function CustomerSignupPage() {
         }
       }
 
-
       // 3) Still no token: do NOT send the user to the dashboard (it would
       //    bounce them straight back out). Send them to the login page instead.
       if (!token) {
@@ -351,7 +324,6 @@ export default function CustomerSignupPage() {
         setTimeout(() => router.push(LOGIN_ROUTE), 1500);
         return;
       }
-
 
       // 4) Save the session, then go to the dashboard.
       const user: Record<string, unknown> = {
@@ -362,7 +334,6 @@ export default function CustomerSignupPage() {
         phone: backendUser.phone || formData.phone.trim(),
       };
       saveSession(String(token), user);
-
 
       setSuccessMsg('Account created successfully! Welcome to Rydnow. Taking you to your dashboard ...');
       router.push(DASHBOARD_ROUTE);
@@ -381,14 +352,12 @@ export default function CustomerSignupPage() {
     }
   };
 
-
   // Simple 3-step password meter
   const pwScore =
     (formData.password.length >= 6 ? 1 : 0) +
     (formData.password.length >= 10 ? 1 : 0) +
     (/[A-Z]/.test(formData.password) && /\d/.test(formData.password) ? 1 : 0);
   const pwColors = ['#EF4444', '#F2A900', '#10B981'];
-
 
   return (
     <div
@@ -421,7 +390,6 @@ export default function CustomerSignupPage() {
           <span className="w-10" aria-hidden />
         </header>
 
-
         {/* intro */}
         <section className="mt-5 flex items-center gap-4">
           <div className="min-w-0 flex-1">
@@ -444,7 +412,6 @@ export default function CustomerSignupPage() {
           </svg>
         </section>
 
-
         {/* form card */}
         <main className="mt-6 rounded-3xl border border-white/10 bg-white/[0.04] p-5 backdrop-blur">
           {error && (
@@ -457,7 +424,6 @@ export default function CustomerSignupPage() {
             </div>
           )}
 
-
           {successMsg && (
             <div
               role="status"
@@ -467,7 +433,6 @@ export default function CustomerSignupPage() {
               <span>{successMsg}</span>
             </div>
           )}
-
 
           <form onSubmit={handleSubmitForm} className="space-y-4">
             <Field label="Full name" icon="user">
@@ -484,7 +449,6 @@ export default function CustomerSignupPage() {
               />
             </Field>
 
-
             <Field label="Email address" icon="mail">
               <input
                 type="email"
@@ -500,7 +464,6 @@ export default function CustomerSignupPage() {
               />
             </Field>
 
-
             <Field label="Phone number" icon="phone" hint="Ghana numbers only, e.g. 0241234567 or +233241234567">
               <input
                 type="tel"
@@ -514,7 +477,6 @@ export default function CustomerSignupPage() {
                 className={inputCls}
               />
             </Field>
-
 
             <div>
               <Field
@@ -556,7 +518,6 @@ export default function CustomerSignupPage() {
               )}
             </div>
 
-
             <Field
               label="Confirm Password"
               icon="lock"
@@ -583,7 +544,6 @@ export default function CustomerSignupPage() {
               />
             </Field>
 
-
             <button
               type="submit"
               disabled={loading || !!successMsg}
@@ -600,14 +560,12 @@ export default function CustomerSignupPage() {
             </button>
           </form>
 
-
           <ul className="mt-5 grid grid-cols-3 gap-2 text-center text-[11px] font-semibold text-slate-300">
             <li className="rounded-lg bg-white/5 px-1 py-2">Verified riders</li>
             <li className="rounded-lg bg-white/5 px-1 py-2">Live tracking</li>
             <li className="rounded-lg bg-white/5 px-1 py-2">Clear pricing</li>
           </ul>
         </main>
-
 
         {/* footer */}
         <footer className="mt-auto pt-8 text-center">
