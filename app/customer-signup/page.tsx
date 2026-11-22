@@ -9,14 +9,14 @@ import Link from 'next/link';
 //   browser -> /api/rydnow/auth/register/customer/ -> proxy -> https://rydnow-backend.onrender.com/api/auth/register/customer/
 // The old code read NEXT_PUBLIC_API_BASE (which is "/api/rydnow" for lib/rydnow/api.ts) and
 // built ".../api/rydnow/api/auth/..." = 404.
-const API_BASE = '/api/rydnow';
-const REGISTER_URL = `${API_BASE}/api/auth/register/customer/`;
+const API_BASE = '/api/rydnow/';
+const REGISTER_URL = `${API_BASE}/auth/register/customer/`;
 const LOGIN_URL = `${API_BASE}/auth/login/`;
 const REQUEST_TIMEOUT_MS = 60000;
 
 // FIX: these two were used but never defined (ReferenceError after a successful signup).
 const LOGIN_ROUTE = '/login';
-const DASHBOARD_ROUTE = '/customer-dashboard'; // <- change if your customer dashboard lives at another path
+const DASHBOARD_ROUTE = '/customer-dashboard/'; // <- change if your customer dashboard lives at another path
 
 const BRAND = {
   navy: '#0A2342',
