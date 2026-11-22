@@ -10,7 +10,7 @@ import Link from 'next/link';
 // The old code read NEXT_PUBLIC_API_BASE (which is "/api/rydnow" for lib/rydnow/api.ts) and
 // built ".../api/rydnow/api/auth/..." = 404.
 const API_BASE = '/api/rydnow';
-const REGISTER_URL = `${API_BASE}/auth/register/customer/`;
+const REGISTER_URL = `${API_BASE}/api/auth/register/customer/`;
 const LOGIN_URL = `${API_BASE}/auth/login/`;
 const REQUEST_TIMEOUT_MS = 60000;
 
