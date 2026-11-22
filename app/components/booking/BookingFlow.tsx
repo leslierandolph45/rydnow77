@@ -1,6 +1,5 @@
 'use client';
 
-
 /**
  * RYDNOW booking flow (single file).
  *
@@ -16,57 +15,52 @@
  *     onUnauthorized={signOut}
  *   />
  *
- * File map: 1. Settings & types  2. Helpers  3. Small components  4. Steps  5. Quote hook  6. BookingFlow
+ * File map: 1. Settings & types  2. Helpers  3. Small components  4. Quote hook  5. BookingFlow
  */
-
 
 import Image from 'next/image';
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
-
 import {
   api,
-  ApiError,
   friendlyError,
+  isAbort,
+  isApiError,
+  needsNewQuote,
   type Booking,
   type Quote,
-  type StopInput,
+  type QuoteBreakdown,
+  type TripInput,
 } from '@/lib/rydnow/api';
 import {
+  ONLINE_PAYMENT_METHODS,
+  PAYMENT_LABEL,
   PAYMENT_METHODS,
+  QUOTE_FALLBACK_TTL_SECONDS,
+  SERVICE_HINTS,
+  SERVICE_LABELS,
   SERVICE_ORDER,
-  SERVICES,
+  SURGE_REASON_LABELS,
   money,
   type PaymentMethod,
   type Place,
+  type ServiceHints,
   type ServiceKey,
 } from '@/lib/rydnow/config';
 import { currentPosition, reversePlace } from '@/lib/rydnow/geocode';
 
-
 import { useCountdown, usePlaces } from '@/app/components/dashboard/hooks';
 import PlaceField from '@/app/components/dashboard/PlaceField';
-import {
-  Icon,
-  RouteSummary,
-  SERVICE_ICON,
-  Spinner,
-  inputCls,
-} from '@/app/components/dashboard/ui';
-
+import { Icon, RouteSummary, SERVICE_ICON, Spinner, inputCls } from '@/app/components/dashboard/ui';
 
 // ═══ 1. SETTINGS & TYPES ═══
-
 
 const QUOTE_DEBOUNCE_MS = 450;
 const MIN_SCHEDULE_LEAD_MS = 15 * 60 * 1000;
 const RING = 2 * Math.PI * 24; // price-lock countdown ring (r = 24)
 
-
 type StepId = 'trip' | 'details' | 'review' | 'pay';
-type ServiceConfig = (typeof SERVICES)[ServiceKey];
-
 
 const STEPS: { id: StepId; label: string }[] = [
   { id: 'trip', label: 'Trip' },
@@ -75,6 +69,27 @@ const STEPS: { id: StepId; label: string }[] = [
   { id: 'pay', label: 'Pay' },
 ];
 
+/** Display wording for a service. Static copy only: the backend does not send it. */
+interface ServiceUi {
+  name: string;
+  blurb: string;
+  provider: string;
+  providers: string;
+  pickupLabel: string;
+  dropoffLabel: string;
+  notesLabel: string;
+  notesPlaceholder: string;
+}
+
+/** Wording + backend limits for the selected service. */
+type ServiceView = ServiceUi & ServiceHints;
+
+/** A quote plus the client-side clock values the price-lock countdown needs. */
+interface LiveQuote {
+  quote: Quote;
+  receivedAtMs: number;
+  expiresAtMs: number;
+}
 
 interface StopDraft {
   id: string;
@@ -97,10 +112,41 @@ interface OptionItem {
   desc: string;
 }
 
-
 const EMPTY_PARCEL: ParcelDraft = { category: '', recipientName: '', recipientPhone: '', item: '' };
 const EMPTY_WASTE: WasteDraft = { type: '', bins: '' };
 
+const SERVICE_UI: Record<ServiceKey, ServiceUi> = {
+  okada: {
+    name: SERVICE_LABELS.okada,
+    blurb: 'Fast bike rides',
+    provider: 'rider',
+    providers: 'riders',
+    pickupLabel: 'Pickup',
+    dropoffLabel: 'Drop-off',
+    notesLabel: 'Note for your rider',
+    notesPlaceholder: 'e.g. I’m at the blue gate',
+  },
+  parcel: {
+    name: SERVICE_LABELS.parcel,
+    blurb: 'Send anything across town',
+    provider: 'rider',
+    providers: 'riders',
+    pickupLabel: 'Pickup',
+    dropoffLabel: 'Deliver to',
+    notesLabel: 'Delivery notes',
+    notesPlaceholder: 'e.g. Fragile, call the recipient on arrival',
+  },
+  'waste-bin': {
+    name: SERVICE_LABELS['waste-bin'],
+    blurb: 'Bin and waste pickups',
+    provider: 'collector',
+    providers: 'collectors',
+    pickupLabel: 'Collection point',
+    dropoffLabel: '',
+    notesLabel: 'Access notes',
+    notesPlaceholder: 'e.g. Bins are behind the gate',
+  },
+};
 
 const DELIVERY_CATEGORIES: readonly OptionItem[] = [
   { id: 'Food', label: '🍔 Food delivery', desc: 'Hot meals & restaurant orders' },
@@ -109,7 +155,6 @@ const DELIVERY_CATEGORIES: readonly OptionItem[] = [
   { id: 'Other', label: '🎁 Other', desc: 'Anything else that needs delivering' },
 ];
 
-
 const WASTE_TYPES: readonly OptionItem[] = [
   { id: 'Household waste', label: '🏠 Household waste', desc: 'General home rubbish' },
   { id: 'Recycling', label: '♻️ Recycling', desc: 'Paper, plastic, glass & metal' },
@@ -117,9 +162,14 @@ const WASTE_TYPES: readonly OptionItem[] = [
   { id: 'Garden waste', label: '🌿 Garden waste', desc: 'Leaves, branches & grass' },
 ];
 
-
 const PAY_ICON: Record<PaymentMethod, string> = { cash: '💵', momo: '📱', card: '💳', wallet: '👛' };
 
+const PAY_HINT: Record<PaymentMethod, string> = {
+  cash: 'Pay your rider at the end of the trip',
+  momo: 'Pay securely with Mobile Money',
+  card: 'Pay securely with your card',
+  wallet: 'Use your RYDNOW balance',
+};
 
 export interface BookingFlowProps {
   /** Called after the booking is created (and, for hosted checkout, never: the page redirects instead). */
@@ -135,20 +185,14 @@ export interface BookingFlowProps {
   disableAutoLocate?: boolean;
 }
 
-
 // ═══ 2. HELPERS ═══
 
-
 const uid = () =>
-  typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random()}`;
-
+  typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
 
 const mmss = (seconds: number) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 const cleanPhone = (v: string) => v.replace(/[\s\-()]/g, '');
 const isGhPhone = (v: string) => /^(\+233|233|0)\d{9}$/.test(cleanPhone(v));
-
 
 /** Value for <input type="datetime-local"> in the customer's local time. */
 function localInputValue(d: Date) {
@@ -156,9 +200,26 @@ function localInputValue(d: Date) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+/** Wrap a quote with the local clock values the countdown needs. Uses the server's lifetime, not its clock. */
+function toLiveQuote(quote: Quote): LiveQuote {
+  const receivedAtMs = Date.now();
+  const ttl = quote.expires_in_seconds > 0 ? quote.expires_in_seconds : QUOTE_FALLBACK_TTL_SECONDS;
+  return { quote, receivedAtMs, expiresAtMs: receivedAtMs + ttl * 1000 };
+}
+
+/** Rows for the price breakdown, exactly as the backend itemised them. Display only. */
+function priceLines(b: QuoteBreakdown): { label: string; amount: number }[] {
+  const rows = [
+    { label: 'Trip fare', amount: b.ride_fare },
+    { label: 'Extra stops', amount: b.stop_fees },
+    { label: 'Waiting time', amount: b.waiting_charge },
+    { label: 'Booking fee', amount: b.booking_fee },
+  ].filter((r) => r.amount > 0);
+  if (b.discount > 0) rows.push({ label: b.promo_code ? `Promo ${b.promo_code}` : 'Discount', amount: -b.discount });
+  return rows;
+}
 
 // ═══ 3. SMALL COMPONENTS ═══
-
 
 function Card({ children, className = '', label }: { children: ReactNode; className?: string; label?: string }) {
   return (
@@ -167,7 +228,6 @@ function Card({ children, className = '', label }: { children: ReactNode; classN
     </section>
   );
 }
-
 
 function Field({ label, id, children }: { label: string; id: string; children: ReactNode }) {
   return (
@@ -179,7 +239,6 @@ function Field({ label, id, children }: { label: string; id: string; children: R
     </div>
   );
 }
-
 
 function OptionButton({ on, label, desc, onClick }: { on: boolean; label: string; desc: string; onClick: () => void }) {
   return (
@@ -196,7 +255,6 @@ function OptionButton({ on, label, desc, onClick }: { on: boolean; label: string
     </button>
   );
 }
-
 
 function TripRow({ kind, first, last, children }: { kind: 'pickup' | 'stop' | 'dest'; first: boolean; last: boolean; children: ReactNode }) {
   const line = first && last ? 'hidden' : first ? 'top-6 bottom-0' : last ? 'top-0 h-6' : 'inset-y-0';
@@ -217,7 +275,6 @@ function TripRow({ kind, first, last, children }: { kind: 'pickup' | 'stop' | 'd
   );
 }
 
-
 /** Progress header. Completed steps are tappable so the customer can go back and edit. */
 function Stepper({ current, onJump }: { current: StepId; onJump: (id: StepId) => void }) {
   const index = STEPS.findIndex((s) => s.id === current);
@@ -237,11 +294,7 @@ function Stepper({ current, onJump }: { current: StepId; onJump: (id: StepId) =>
                 aria-label={`${s.label}${done ? ', completed. Tap to edit' : on ? ', current step' : ''}`}
                 className="group text-left disabled:cursor-default"
               >
-                <span
-                  className={`block h-1.5 rounded-full transition-colors ${
-                    done ? 'bg-[#1E3FCE]' : on ? 'bg-[#F5B82E]' : 'bg-gray-200'
-                  }`}
-                />
+                <span className={`block h-1.5 rounded-full transition-colors ${done ? 'bg-[#1E3FCE]' : on ? 'bg-[#F5B82E]' : 'bg-gray-200'}`} />
                 <span className={`mt-1.5 block truncate text-[11px] font-bold ${on ? 'text-gray-900' : done ? 'text-[#1E3FCE]' : 'text-gray-400'}`}>
                   {s.label}
                 </span>
@@ -254,21 +307,20 @@ function Stepper({ current, onJump }: { current: StepId; onJump: (id: StepId) =>
   );
 }
 
-
-function PriceCard({ quote, quoting, error, onRetry }: { quote: Quote | null; quoting: boolean; error: string; onRetry: () => void }) {
-  const left = useCountdown(quote?.expiresAtMs);
-  const total = quote ? Math.max(1, Math.round((quote.expiresAtMs - quote.receivedAtMs) / 1000)) : 1;
-
+function PriceCard({ live, quoting, error, onRetry }: { live: LiveQuote | null; quoting: boolean; error: string; onRetry: () => void }) {
+  const left = useCountdown(live?.expiresAtMs);
+  const q = live?.quote ?? null;
+  const total = live ? Math.max(1, Math.round((live.expiresAtMs - live.receivedAtMs) / 1000)) : 1;
+  const surgeReason = q ? SURGE_REASON_LABELS[q.surge.reason] : '';
 
   return (
     <section aria-label="Your price" aria-live="polite" className="min-h-[7.5rem] rounded-2xl border-2 border-[#F5B82E] bg-white p-4">
-      {quoting && !quote && !error && (
+      {quoting && !q && !error && (
         <div className="space-y-2" aria-label="Getting your price">
           <div className="h-9 w-2/3 animate-pulse rounded-lg bg-gray-100" />
           <div className="h-5 w-full animate-pulse rounded-lg bg-gray-100" />
         </div>
       )}
-
 
       {error && (
         <div className="flex items-center gap-3 rounded-xl bg-red-50 p-3" role="alert">
@@ -279,18 +331,12 @@ function PriceCard({ quote, quoting, error, onRetry }: { quote: Quote | null; qu
         </div>
       )}
 
-
-      {quote && !error && (
+      {live && q && !error && (
         <div className="space-y-3">
           <div className="flex items-center justify-between gap-3">
             <div className="min-w-0">
               <p className="text-xs text-gray-500">Your price</p>
-              <p className="text-3xl font-extrabold leading-tight tracking-tight text-[#1E3FCE]">
-                {money(quote.total, quote.currency)}
-                {quote.discount > 0 && (
-                  <span className="ml-2 text-base font-medium text-gray-400 line-through">{money(quote.original, quote.currency)}</span>
-                )}
-              </p>
+              <p className="text-3xl font-extrabold leading-tight tracking-tight text-[#1E3FCE]">{money(q.total_price)}</p>
             </div>
             <div className="relative h-14 w-14 shrink-0" title="Price held for you">
               <svg width="56" height="56" viewBox="0 0 56 56" className="-rotate-90" aria-hidden>
@@ -314,54 +360,42 @@ function PriceCard({ quote, quoting, error, onRetry }: { quote: Quote | null; qu
             {quoting ? 'Refreshing your price…' : `Locked for you for ${mmss(left)}. If it runs out we refresh it automatically.`}
           </p>
 
-
-          {quote.surge > 1 && (
+          {q.surge.active && q.surge.multiplier > 1 && (
             <p className="rounded-xl bg-amber-50 px-3 py-2 text-xs text-amber-900">
-              It’s busier than usual, so fares are ×{quote.surge.toFixed(1)} right now. This is already included in your price.
+              {surgeReason ? `${surgeReason}: ` : ''}fares are ×{q.surge.multiplier.toFixed(1)} right now. This is already included in your price.
             </p>
           )}
 
+          {q.distance_km > 0 && <p className="text-xs text-gray-500">{q.distance_km.toFixed(1)} km</p>}
 
-          {(quote.distanceKm !== null || quote.durationMin !== null) && (
-            <p className="text-xs text-gray-500">
-              {quote.distanceKm !== null && `${quote.distanceKm.toFixed(1)} km`}
-              {quote.distanceKm !== null && quote.durationMin !== null && ' · '}
-              {quote.durationMin !== null && `about ${Math.round(quote.durationMin)} min`}
-            </p>
-          )}
-
-
-          {quote.lines.length > 0 && (
-            <ul className="space-y-1.5 border-t border-gray-100 pt-3 text-sm">
-              {quote.lines.map((l) => (
-                <li key={l.label} className={`flex justify-between gap-3 ${l.amount < 0 ? 'font-bold text-green-700' : 'text-gray-700'}`}>
-                  <span>{l.label}</span>
-                  <span className="tabular-nums">
-                    {l.amount < 0 ? '−' : ''}
-                    {money(Math.abs(l.amount), quote.currency)}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          )}
+          <ul className="space-y-1.5 border-t border-gray-100 pt-3 text-sm">
+            {priceLines(q.breakdown).map((l) => (
+              <li key={l.label} className={`flex justify-between gap-3 ${l.amount < 0 ? 'font-bold text-green-700' : 'text-gray-700'}`}>
+                <span>{l.label}</span>
+                <span className="tabular-nums">
+                  {l.amount < 0 ? '−' : ''}
+                  {money(Math.abs(l.amount))}
+                </span>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
     </section>
   );
 }
 
-
 function PromoCard(props: {
   promo: string;
   input: string;
   error: string;
-  quote: Quote | null;
+  discount: number;
   quoting: boolean;
   onInputChange: (v: string) => void;
   onApply: () => void;
   onRemove: () => void;
 }) {
-  const { promo, input, error, quote, quoting, onInputChange, onApply, onRemove } = props;
+  const { promo, input, error, discount, quoting, onInputChange, onApply, onRemove } = props;
   return (
     <section className="rounded-2xl border-2 border-dashed border-[#F5B82E] bg-amber-50/60 p-4" aria-label="Promo code">
       <div className="mb-3 flex items-center gap-2">
@@ -374,7 +408,6 @@ function PromoCard(props: {
         </div>
       </div>
 
-
       {promo ? (
         <div className="flex items-center gap-3 rounded-xl border border-green-200 bg-white px-3 py-2.5">
           <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-green-100 text-green-700">
@@ -383,11 +416,7 @@ function PromoCard(props: {
           <div className="min-w-0 flex-1">
             <p className="text-sm font-extrabold text-gray-900">{promo}</p>
             <p className="text-xs text-green-700">
-              {quote && quote.discount > 0
-                ? `You save ${money(quote.discount, quote.currency)}`
-                : quoting
-                  ? 'Checking your code…'
-                  : 'Applied when your trip is priced'}
+              {discount > 0 ? `You save ${money(discount)}` : quoting ? 'Checking your code…' : 'Applied when your trip is priced'}
             </p>
           </div>
           <button type="button" onClick={onRemove} className="py-2 pl-2 text-xs font-bold text-gray-500">
@@ -417,7 +446,6 @@ function PromoCard(props: {
         </div>
       )}
 
-
       {error && (
         <p className="mt-2 text-xs text-red-700" role="alert">
           {error}
@@ -427,62 +455,56 @@ function PromoCard(props: {
   );
 }
 
+/** Own ticker so the page does not re-render every second. */
+function LockNote({ live, quoting }: { live: LiveQuote; quoting: boolean }) {
+  const left = useCountdown(live.expiresAtMs);
+  return <p className="mt-1 text-xs text-gray-500">{quoting ? 'Refreshing your price…' : `Price locked for ${mmss(left)}`}</p>;
+}
 
 // ═══ 4. QUOTE HOOK ═══
 
-
-type QuoteRequest = Parameters<typeof api.quote>[0];
-
-
 interface QuoteOptions {
   /** null while the form is incomplete or the customer has not reached Review. Must be memoised. */
-  input: QuoteRequest | null;
+  input: TripInput | null;
   paused: boolean;
   /** Both callbacks must be stable (useCallback). */
   onUnauthorized: () => void;
   onPromoRejected: (message: string) => void;
 }
 
-
 /** Fetches a signed, price-locked quote and refreshes it automatically when the lock expires. */
 function useQuote({ input, paused, onUnauthorized, onPromoRejected }: QuoteOptions) {
-  const [quote, setQuote] = useState<Quote | null>(null);
+  const [live, setLive] = useState<LiveQuote | null>(null);
   const [quoting, setQuoting] = useState(false);
   const [error, setError] = useState('');
   const [priceChanged, setPriceChanged] = useState('');
   const [tick, setTick] = useState(0);
 
-
   const requestId = useRef(0);
   const lastTotal = useRef<number | null>(null);
   const autoRefresh = useRef(false);
-
 
   const refresh = useCallback((auto = false) => {
     autoRefresh.current = auto;
     setTick((n) => n + 1);
   }, []);
 
-
   const reset = useCallback(() => {
-    setQuote(null);
+    setLive(null);
     setError('');
     setPriceChanged('');
     lastTotal.current = null;
   }, []);
 
-
   const clearPriceChanged = useCallback(() => setPriceChanged(''), []);
-
 
   useEffect(() => {
     if (!input) {
-      setQuote(null);
+      setLive(null);
       setError('');
       setQuoting(false);
       return;
     }
-
 
     const id = ++requestId.current;
     const ctrl = new AbortController();
@@ -490,28 +512,25 @@ function useQuote({ input, paused, onUnauthorized, onPromoRejected }: QuoteOptio
     setError('');
     if (!autoRefresh.current) setPriceChanged('');
 
-
     const timer = setTimeout(async () => {
       try {
-        const q = await api.quote(input, ctrl.signal);
+        const q = await api.booking.quote(input, { signal: ctrl.signal });
         if (id !== requestId.current) return;
 
-
-        if (autoRefresh.current && lastTotal.current !== null && Math.abs(lastTotal.current - q.total) >= 0.01) {
-          setPriceChanged(`Your price was refreshed: ${money(lastTotal.current, q.currency)} is now ${money(q.total, q.currency)}.`);
+        if (autoRefresh.current && lastTotal.current !== null && Math.abs(lastTotal.current - q.total_price) >= 0.01) {
+          setPriceChanged(`Your price was refreshed: ${money(lastTotal.current)} is now ${money(q.total_price)}.`);
         }
         autoRefresh.current = false;
-        lastTotal.current = q.total;
+        lastTotal.current = q.total_price;
 
-
-        if (input.promo && q.discount <= 0) onPromoRejected('This code can’t be applied to this trip.');
-        setQuote(q);
+        if (input.promoCode && q.breakdown.discount <= 0) onPromoRejected('This code can’t be applied to this trip.');
+        setLive(toLiveQuote(q));
       } catch (e) {
-        if (id !== requestId.current || (e instanceof DOMException && e.name === 'AbortError')) return;
-        setQuote(null);
-        if (e instanceof ApiError && e.status === 401) return onUnauthorized();
-        if (input.promo && e instanceof ApiError && e.fields.promo_code) {
-          onPromoRejected(e.fields.promo_code);
+        if (id !== requestId.current || isAbort(e)) return;
+        setLive(null);
+        if (isApiError(e) && e.status === 401) return onUnauthorized();
+        if (input.promoCode && isApiError(e) && (e.code === 'promo_rejected' || e.fieldErrors.promo_code?.length)) {
+          onPromoRejected(e.fieldErrors.promo_code?.[0] ?? e.userMessage);
           return;
         }
         setError(friendlyError(e));
@@ -520,28 +539,23 @@ function useQuote({ input, paused, onUnauthorized, onPromoRejected }: QuoteOptio
       }
     }, QUOTE_DEBOUNCE_MS);
 
-
     return () => {
       clearTimeout(timer);
       ctrl.abort();
     };
   }, [input, tick, onUnauthorized, onPromoRejected]);
 
-
   // Ask for a fresh price the moment the lock runs out.
   useEffect(() => {
-    if (!quote || !input || paused) return;
-    const timer = setTimeout(() => refresh(true), Math.max(0, quote.expiresAtMs - Date.now()));
+    if (!live || !input || paused) return;
+    const timer = setTimeout(() => refresh(true), Math.max(0, live.expiresAtMs - Date.now()));
     return () => clearTimeout(timer);
-  }, [quote, input, paused, refresh]);
+  }, [live, input, paused, refresh]);
 
-
-  return { quote, quoting, error, priceChanged, refresh, reset, clearPriceChanged };
+  return { live, quoting, error, priceChanged, refresh, reset, clearPriceChanged };
 }
 
-
 // ═══ 5. BOOKING FLOW ═══
-
 
 export default function BookingFlow({
   onComplete,
@@ -555,10 +569,10 @@ export default function BookingFlow({
   const places = usePlaces();
   const bodyRef = useRef<HTMLDivElement>(null);
 
-
   // ---- wizard state ----
   const [step, setStep] = useState<StepId>('trip');
-  const [service, setService] = useState<ServiceKey>(initialService);
+  // Never start on an unknown service key: cfg below must always exist.
+  const [service, setService] = useState<ServiceKey>(SERVICE_UI[initialService] ? initialService : 'okada');
   const [pickup, setPickup] = useState<Place | null>(initialPickup);
   const [dropoff, setDropoff] = useState<Place | null>(initialDropoff);
   const [stops, setStops] = useState<StopDraft[]>([]);
@@ -571,26 +585,22 @@ export default function BookingFlow({
   const [promo, setPromo] = useState('');
   const [promoError, setPromoError] = useState('');
   const [payment, setPayment] = useState<PaymentMethod | null>(null);
-  const [momoNumber, setMomoNumber] = useState('');
   const [locating, setLocating] = useState(false);
   const [locationNote, setLocationNote] = useState('');
-
 
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
   const [needsSignIn, setNeedsSignIn] = useState(false);
 
-
-  const cfg: ServiceConfig = SERVICES[service];
+  /** Wording + backend limits for the selected service. Both maps are keyed by ServiceKey. */
+  const cfg = useMemo<ServiceView>(() => ({ ...SERVICE_UI[service], ...SERVICE_HINTS[service] }), [service]);
   const stepIndex = STEPS.findIndex((s) => s.id === step);
   const handleUnauthorized = useCallback(() => onUnauthorized?.(), [onUnauthorized]);
-
 
   // Scroll to the top of the body whenever the step changes.
   useEffect(() => {
     bodyRef.current?.scrollTo({ top: 0 });
   }, [step]);
-
 
   // ─── location ───
   const locate = useCallback(async (silent = false) => {
@@ -614,7 +624,6 @@ export default function BookingFlow({
     }
   }, []);
 
-
   useEffect(() => {
     if (disableAutoLocate || initialPickup) return;
     if (typeof navigator === 'undefined' || !navigator.permissions?.query) return;
@@ -624,21 +633,18 @@ export default function BookingFlow({
       .catch(() => undefined);
   }, [locate, disableAutoLocate, initialPickup]);
 
-
   // ─── validation, one blocker message per step ───
-  const sameSpot = cfg.needsDestination && !!pickup && !!dropoff && pickup.lat === dropoff.lat && pickup.lng === dropoff.lng;
+  const sameSpot = cfg.requiresDestination && !!pickup && !!dropoff && pickup.lat === dropoff.lat && pickup.lng === dropoff.lng;
   const stopPlaces = useMemo(() => stops.map((s) => s.place).filter((p): p is Place => !!p), [stops]);
   const minLater = useMemo(() => localInputValue(new Date(Date.now() + MIN_SCHEDULE_LEAD_MS)), [when]); // eslint-disable-line react-hooks/exhaustive-deps
 
-
   const tripBlocker = (() => {
     if (!pickup) return `Add your ${cfg.pickupLabel.toLowerCase()}`;
-    if (cfg.needsDestination && !dropoff) return `Add your ${cfg.dropoffLabel.toLowerCase()}`;
+    if (cfg.requiresDestination && !dropoff) return `Add your ${cfg.dropoffLabel.toLowerCase()}`;
     if (sameSpot) return 'Pickup and drop-off are the same place';
     if (stops.some((s) => !s.place)) return 'Finish or remove the extra stop';
     return '';
   })();
-
 
   const detailsBlocker = (() => {
     if (service === 'parcel' && !parcel.category) return 'Choose what you’re sending';
@@ -649,49 +655,46 @@ export default function BookingFlow({
     return '';
   })();
 
-
   // ─── quote (only while the customer is on Review or Pay) ───
-  const quoteInput = useMemo<QuoteRequest | null>(() => {
+  // The ONE trip description: the quote and the booking are both built from it, because the
+  // quote token signs the route and booking creation rejects it if anything differs.
+  const trip = useMemo<TripInput | null>(() => {
     if (step !== 'review' && step !== 'pay') return null;
     if (tripBlocker || !pickup) return null;
-    const dest = cfg.needsDestination ? dropoff : pickup;
-    if (!dest) return null;
-    const placed = stops.map((s) => (s.place ? { ...s.place, wait_minutes: s.wait } : null));
-    if (placed.some((p) => p === null)) return null;
-    return { service, pickup, dropoff: dest, stops: placed as StopInput[], promo };
-  }, [step, tripBlocker, service, pickup, dropoff, stops, promo, cfg.needsDestination]);
-
+    return {
+      service,
+      pickup,
+      destination: cfg.requiresDestination ? (dropoff ?? undefined) : undefined,
+      stops: stops.map((s) => ({ ...(s.place as Place), waitMinutes: s.wait })),
+      promoCode: promo || undefined,
+    };
+  }, [step, tripBlocker, service, pickup, dropoff, stops, promo, cfg.requiresDestination]);
 
   const rejectPromo = useCallback((message: string) => {
     setPromo('');
     setPromoError(message);
   }, []);
 
+  const {
+    live,
+    quoting,
+    error: quoteError,
+    priceChanged,
+    refresh: refreshQuote,
+    reset: resetQuote,
+    clearPriceChanged,
+  } = useQuote({ input: trip, paused: submitting, onUnauthorized: handleUnauthorized, onPromoRejected: rejectPromo });
 
-  const { quote, quoting, error: quoteError, priceChanged, refresh: refreshQuote, reset: resetQuote, clearPriceChanged } = useQuote({
-    input: quoteInput,
-    paused: submitting,
-    onUnauthorized: handleUnauthorized,
-    onPromoRejected: rejectPromo,
-  });
-
-
-  const reviewBlocker = quoting || !quote ? (quoteError ? 'Price unavailable. Tap Retry above' : 'Getting your price…') : '';
-  const payBlocker = !payment
-    ? 'Choose how to pay'
-    : payment === 'momo' && !isGhPhone(momoNumber)
-      ? 'Enter a valid Mobile Money number'
-      : reviewBlocker;
-
+  const reviewBlocker = quoting || !live ? (quoteError ? 'Price unavailable. Tap Retry above' : 'Getting your price…') : '';
+  const payBlocker = !payment ? 'Choose how to pay' : reviewBlocker;
 
   const blocker = step === 'trip' ? tripBlocker : step === 'details' ? detailsBlocker : step === 'review' ? reviewBlocker : payBlocker;
-
 
   // ─── form handlers ───
   function chooseService(next: ServiceKey) {
     if (next === service) return;
     setService(next);
-    setStops((s) => s.slice(0, SERVICES[next].maxStops));
+    setStops((s) => s.slice(0, SERVICE_HINTS[next].maxStops));
     resetQuote();
   }
   const addStop = () => setStops((s) => [...s, { id: uid(), place: null, wait: 0 }]);
@@ -700,7 +703,6 @@ export default function BookingFlow({
   const patchParcel = (patch: Partial<ParcelDraft>) => setParcel((p) => ({ ...p, ...patch }));
   const patchWaste = (patch: Partial<WasteDraft>) => setWaste((w) => ({ ...w, ...patch }));
 
-
   const applyPromo = () => {
     const code = promoInput.trim().toUpperCase();
     if (!code) return setPromoError('Enter a promo code');
@@ -708,7 +710,6 @@ export default function BookingFlow({
     setPromo(code);
     setPromoInput('');
   };
-
 
   function composeNotes() {
     const parts: string[] = [];
@@ -725,7 +726,6 @@ export default function BookingFlow({
     return parts.join('\n').slice(0, 1000);
   }
 
-
   // ─── navigation ───
   const goBack = () => {
     if (submitting) return;
@@ -735,19 +735,21 @@ export default function BookingFlow({
     setStep(STEPS[stepIndex - 1].id);
   };
 
-
   const jumpTo = (id: StepId) => {
     if (submitting) return;
     setSubmitError('');
     setStep(id);
   };
 
-
   async function confirm() {
-    if (blocker || !quote || !pickup || submitting || !payment) return;
-    const dest = cfg.needsDestination ? dropoff : pickup;
-    if (!dest) return;
+    if (blocker || !live || !trip || submitting || !payment) return;
 
+    const quoteToken = live.quote.quote_token;
+    if (!quoteToken) {
+      setSubmitError('Please sign in to confirm your booking. Your trip details are saved on this screen.');
+      setNeedsSignIn(true);
+      return;
+    }
 
     setSubmitting(true);
     setSubmitError('');
@@ -755,29 +757,38 @@ export default function BookingFlow({
     clearPriceChanged();
     let redirecting = false;
     try {
-      const booking = await api.createBooking({
-        quote,
-        service,
-        pickup,
-        dropoff: dest,
-        stops: stops.map((s) => ({ ...(s.place as Place), wait_minutes: s.wait })),
-        notes: composeNotes(),
-        paymentMethod: payment,
-        scheduledFor: when === 'later' && scheduled ? new Date(scheduled).toISOString() : null,
-        momoNumber: payment === 'momo' ? cleanPhone(momoNumber) : undefined,
-      });
-      if (cfg.needsDestination && dropoff) places.remember(dropoff);
-      if (booking.paymentUrl) {
-        redirecting = true; // hosted checkout for card / Mobile Money
-        window.location.assign(booking.paymentUrl);
+      // Replaying the same quote token returns the same booking, so retrying after a failed
+      // payment start does not create a duplicate.
+      const booking = await api.booking.create(
+        {
+          ...trip,
+          notes: composeNotes(),
+          paymentMethod: payment,
+          scheduledFor: when === 'later' && scheduled ? new Date(scheduled) : null,
+        },
+        quoteToken,
+      );
+      if (cfg.requiresDestination && dropoff) places.remember(dropoff);
+
+      if (ONLINE_PAYMENT_METHODS.includes(payment)) {
+        // Mobile Money and card are paid on the hosted Paystack page before dispatch.
+        const init = await api.payments.initialize({ purpose: 'booking', booking_ref: booking.reference });
+        const url = init.authorization_url || init.payment_url;
+        if (!url) {
+          setSubmitError('We couldn’t open the payment page. Please try again.');
+          return;
+        }
+        redirecting = true;
+        window.location.assign(url);
         return;
       }
+
       onComplete(booking);
     } catch (e) {
-      if (e instanceof ApiError && e.fields.quote_token) {
+      if (needsNewQuote(e)) {
         setSubmitError('Your price expired. We’re getting a fresh one. Nothing was booked or charged.');
         refreshQuote(true);
-      } else if (e instanceof ApiError && e.status === 401) {
+      } else if (isApiError(e) && e.status === 401) {
         setSubmitError('Please sign in to confirm your booking. Your trip details are saved on this screen.');
         setNeedsSignIn(true);
       } else {
@@ -788,21 +799,19 @@ export default function BookingFlow({
     }
   }
 
-
   const onPrimary = () => {
     if (blocker || submitting) return;
     if (step === 'pay') return void confirm();
     setStep(STEPS[stepIndex + 1].id);
   };
 
-
   // ─── derived display ───
+  const totalLabel = live ? money(live.quote.total_price) : '';
   const summaryPoints = [
     ...(pickup ? [{ label: cfg.pickupLabel, text: pickup.address }] : []),
     ...stopPlaces.map((p, i) => ({ label: `Stop ${i + 1}`, text: p.address })),
-    ...(cfg.needsDestination && dropoff ? [{ label: cfg.dropoffLabel, text: dropoff.address }] : []),
+    ...(cfg.requiresDestination && dropoff ? [{ label: cfg.dropoffLabel, text: dropoff.address }] : []),
   ];
-
 
   const primaryLabel =
     blocker ||
@@ -811,21 +820,19 @@ export default function BookingFlow({
       : step === 'details'
         ? 'Review price'
         : step === 'review'
-          ? `Continue to payment · ${quote ? money(quote.total, quote.currency) : ''}`
+          ? `Continue to payment · ${totalLabel}`
           : submitting
             ? 'Placing booking…'
             : payment === 'cash'
               ? 'Confirm booking'
-              : `Pay ${quote ? money(quote.total, quote.currency) : ''}`);
-
+              : `Pay ${totalLabel}`);
 
   const stepTitle: Record<StepId, { title: string; hint: string }> = {
     trip: { title: 'Where to?', hint: 'Pick a service, then tell us where we’re going.' },
-    details: { title: 'A few details', hint: 'Help your ' + cfg.provider + ' get it right.' },
+    details: { title: 'A few details', hint: `Help your ${cfg.provider} get it right.` },
     review: { title: 'Check your price', hint: 'Your price is locked while you review.' },
     pay: { title: 'How would you like to pay?', hint: 'You won’t be charged until the booking is placed.' },
   };
-
 
   // ─── step bodies ───
   const tripStep = (
@@ -833,7 +840,7 @@ export default function BookingFlow({
       <section aria-label="Service">
         <div className="grid grid-cols-3 items-stretch gap-2" role="radiogroup" aria-label="Service">
           {SERVICE_ORDER.map((key) => {
-            const s = SERVICES[key];
+            const s = SERVICE_UI[key];
             const on = key === service;
             return (
               <button
@@ -854,19 +861,17 @@ export default function BookingFlow({
                 <Image src={SERVICE_ICON[key]} alt="" width={44} height={44} className="mb-2 h-11 w-11 object-contain" />
                 <span className="text-[13px] font-bold leading-tight text-gray-900">{s.name}</span>
                 <span className="mt-0.5 text-[11px] leading-tight text-gray-500">{s.blurb}</span>
-                <span className="mt-auto pt-2 text-xs font-extrabold text-gray-500">From {money(s.fromPrice)}</span>
               </button>
             );
           })}
         </div>
       </section>
 
-
       <Card label="Trip" className="shadow-md">
-        <TripRow kind="pickup" first last={!cfg.needsDestination && stops.length === 0}>
+        <TripRow kind="pickup" first last={!cfg.requiresDestination && stops.length === 0}>
           <PlaceField
             label={cfg.pickupLabel}
-            placeholder={cfg.needsDestination ? cfg.pickupLabel : 'Where should we collect from?'}
+            placeholder={cfg.requiresDestination ? cfg.pickupLabel : 'Where should we collect from?'}
             value={pickup}
             onChange={setPickup}
             trailing={
@@ -884,7 +889,6 @@ export default function BookingFlow({
           />
         </TripRow>
 
-
         {stops.map((s, i) => (
           <TripRow key={s.id} kind="stop" first={false} last={false}>
             <PlaceField label={`Extra stop ${i + 1}`} placeholder={`Extra stop ${i + 1}`} value={s.place} onChange={(place) => patchStop(s.id, { place })} />
@@ -895,7 +899,7 @@ export default function BookingFlow({
                   <Icon name="minus" className="h-3.5 w-3.5" />
                 </button>
                 <span className="w-12 text-center font-bold text-gray-900">{s.wait} min</span>
-                <button type="button" aria-label="Wait 5 minutes more" onClick={() => patchStop(s.id, { wait: Math.min(60, s.wait + 5) })} className="flex h-9 w-9 items-center justify-center rounded-full border border-gray-200 bg-white">
+                <button type="button" aria-label="Wait 5 minutes more" onClick={() => patchStop(s.id, { wait: Math.min(cfg.maxWaitMinutes, s.wait + 5) })} className="flex h-9 w-9 items-center justify-center rounded-full border border-gray-200 bg-white">
                   <Icon name="plus" className="h-3.5 w-3.5" />
                 </button>
               </span>
@@ -906,13 +910,11 @@ export default function BookingFlow({
           </TripRow>
         ))}
 
-
-        {cfg.needsDestination && (
+        {cfg.requiresDestination && (
           <TripRow kind="dest" first={false} last>
             <PlaceField label={cfg.dropoffLabel} placeholder="Where to?" value={dropoff} onChange={setDropoff} invalid={sameSpot} />
           </TripRow>
         )}
-
 
         {sameSpot && (
           <p className="mt-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700" role="alert">
@@ -932,8 +934,7 @@ export default function BookingFlow({
         )}
       </Card>
 
-
-      {cfg.needsDestination && !dropoff && places.recent.length > 0 && (
+      {cfg.requiresDestination && !dropoff && places.recent.length > 0 && (
         <section aria-label="Recent places">
           <h3 className="mb-2 text-sm font-bold text-gray-900">Recent places</h3>
           <div className="divide-y divide-gray-50 rounded-2xl border border-gray-100 bg-white">
@@ -950,7 +951,6 @@ export default function BookingFlow({
       )}
     </>
   );
-
 
   const detailsStep = (
     <>
@@ -985,7 +985,6 @@ export default function BookingFlow({
         </Card>
       )}
 
-
       {service === 'waste-bin' && (
         <Card>
           <h3 className="mb-3 text-sm font-bold text-gray-900">Type of waste</h3>
@@ -999,7 +998,6 @@ export default function BookingFlow({
           </Field>
         </Card>
       )}
-
 
       <Card>
         <div className="space-y-4">
@@ -1030,7 +1028,6 @@ export default function BookingFlow({
     </>
   );
 
-
   const reviewStep = (
     <>
       <Card label="Trip summary">
@@ -1049,12 +1046,11 @@ export default function BookingFlow({
         )}
       </Card>
 
-
       <PromoCard
         promo={promo}
         input={promoInput}
         error={promoError}
-        quote={quote}
+        discount={live?.quote.breakdown.discount ?? 0}
         quoting={quoting}
         onInputChange={(v) => {
           setPromoInput(v);
@@ -1067,14 +1063,12 @@ export default function BookingFlow({
         }}
       />
 
-
-      <PriceCard quote={quote} quoting={quoting} error={quoteError} onRetry={() => refreshQuote(false)} />
+      <PriceCard live={live} quoting={quoting} error={quoteError} onRetry={() => refreshQuote(false)} />
       {priceChanged && (
         <p className="rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-900" role="status">
           {priceChanged}
         </p>
       )}
-
 
       <ul className="space-y-2 px-1 text-xs text-gray-500">
         <li>✓ The price you see is the price you pay.</li>
@@ -1086,20 +1080,20 @@ export default function BookingFlow({
     </>
   );
 
-
   const payStep = (
     <>
-      {quote && (
+      {live && (
         <Card label="Order total">
           <div className="flex items-center justify-between gap-3">
             <span className="text-sm text-gray-600">{cfg.name}</span>
-            <span className="text-lg font-extrabold text-[#1E3FCE]">{money(quote.total, quote.currency)}</span>
+            <span className="text-lg font-extrabold text-[#1E3FCE]">{money(live.quote.total_price)}</span>
           </div>
-          {quote.discount > 0 && <p className="mt-1 text-xs font-bold text-green-700">You save {money(quote.discount, quote.currency)}</p>}
-          <LockNote quote={quote} quoting={quoting} />
+          {live.quote.breakdown.discount > 0 && (
+            <p className="mt-1 text-xs font-bold text-green-700">You save {money(live.quote.breakdown.discount)}</p>
+          )}
+          <LockNote live={live} quoting={quoting} />
         </Card>
       )}
-
 
       {priceChanged && (
         <p className="rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-900" role="status">
@@ -1107,29 +1101,28 @@ export default function BookingFlow({
         </p>
       )}
 
-
       <div className="space-y-2" role="radiogroup" aria-label="Payment method">
         {PAYMENT_METHODS.map((m) => {
-          const on = payment === m.key;
+          const on = payment === m;
           return (
             <button
-              key={m.key}
+              key={m}
               type="button"
               role="radio"
               aria-checked={on}
               disabled={submitting}
               onClick={() => {
-                setPayment(m.key);
+                setPayment(m);
                 setSubmitError('');
               }}
               className={`flex w-full items-center gap-3 rounded-xl border-2 p-3 text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#1E3FCE] ${
                 on ? 'border-[#1E3FCE] bg-blue-50' : 'border-gray-200 bg-white'
               }`}
             >
-              <span className="text-2xl">{PAY_ICON[m.key]}</span>
+              <span className="text-2xl">{PAY_ICON[m]}</span>
               <span className="min-w-0 flex-1">
-                <span className="block text-sm font-bold text-gray-900">{m.label}</span>
-                <span className="block text-xs text-gray-500">{m.hint}</span>
+                <span className="block text-sm font-bold text-gray-900">{PAYMENT_LABEL[m]}</span>
+                <span className="block text-xs text-gray-500">{PAY_HINT[m]}</span>
               </span>
               {on && (
                 <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#1E3FCE] text-white">
@@ -1141,28 +1134,13 @@ export default function BookingFlow({
         })}
       </div>
 
-
-      {payment === 'momo' && (
-        <Field label="Mobile Money number" id="bf-momo">
-          <input
-            id="bf-momo"
-            type="tel"
-            inputMode="tel"
-            autoComplete="tel"
-            placeholder="e.g. 055 123 4567"
-            value={momoNumber}
-            disabled={submitting}
-            onChange={(e) => {
-              setMomoNumber(e.target.value);
-              setSubmitError('');
-            }}
-            className={inputCls}
-          />
-        </Field>
+      {payment && ONLINE_PAYMENT_METHODS.includes(payment) && (
+        <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-gray-700">
+          You’ll finish your {PAYMENT_LABEL[payment]} payment on a secure page. Your {cfg.provider} is contacted once it goes through.
+        </p>
       )}
       {payment === 'cash' && <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-gray-700">Pay the {cfg.provider} in cash at the end of your trip. Please keep small change ready.</p>}
       {payment === 'wallet' && <p className="rounded-lg bg-amber-50 px-3 py-2 text-xs text-gray-700">The amount is taken from your wallet now and refunded if you cancel before a {cfg.provider} accepts.</p>}
-
 
       {submitError && (
         <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
@@ -1176,7 +1154,6 @@ export default function BookingFlow({
       )}
     </>
   );
-
 
   // ─── render ───
   return (
@@ -1203,14 +1180,12 @@ export default function BookingFlow({
         <Stepper current={step} onJump={jumpTo} />
       </header>
 
-
       <div ref={bodyRef} className="min-h-0 flex-1 space-y-4 overflow-y-auto overflow-x-hidden overscroll-contain px-4 py-4">
         {step === 'trip' && tripStep}
         {step === 'details' && detailsStep}
         {step === 'review' && reviewStep}
         {step === 'pay' && payStep}
       </div>
-
 
       {/* Footer is part of the layout, so it can never cover content */}
       <footer className="shrink-0 border-t border-gray-100 bg-white px-4 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-3">
@@ -1227,14 +1202,4 @@ export default function BookingFlow({
     </div>
   );
 }
-
-
-/** Own ticker so the page does not re-render every second. */
-function LockNote({ quote, quoting }: { quote: Quote; quoting: boolean }) {
-  const left = useCountdown(quote.expiresAtMs);
-  return <p className="mt-1 text-xs text-gray-500">{quoting ? 'Refreshing your price…' : `Price locked for ${mmss(left)}`}</p>;
-}
-
-
-
 
