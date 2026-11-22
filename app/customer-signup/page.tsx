@@ -13,8 +13,8 @@ const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || 'https://rydnow-backend.on
   .trim()
   .replace(/\/+$/, '')
   .replace(/\/api$/, '');
-const REGISTER_URL = `${API_BASE}/api/auth/register/customer/`;
-const LOGIN_URL = `${API_BASE}/api/auth/login/`;
+const REGISTER_URL = `${API_BASE}/auth/register/customer/`;
+const LOGIN_URL = `${API_BASE}/auth/login/`;
 // Must match the real folder of your dashboard page: app/customer-dashboard/page.tsx
 const DASHBOARD_ROUTE = '/customer-dashboard/';
 const LOGIN_ROUTE = '/login';
