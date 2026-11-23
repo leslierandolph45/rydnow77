@@ -1,18 +1,22 @@
 'use client';
 
-import { useState, ReactNode } from 'react';
+import { useState, useRef, useEffect, ReactNode } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 
 // Browser -> /api/rydnow/<path> -> Next.js proxy -> https://rydnow-backend.onrender.com/api/<path>
-// Base has NO trailing slash and api() below strips stray slashes, so "//" can never appear.
+// Base has NO trailing slash and api() strips leading slashes, so "//" can never appear.
 const API_BASE = '/api/rydnow';
 const api = (path: string) => `${API_BASE}/${path.replace(/^\/+/, '')}`;
 
+// Matches api/urls.py (mounted under /api/):
+//   path("auth/register/customer/", views.customer_register)
+//   path("auth/login/",             views.user_login)
+//   path("auth/token/",             obtain_auth_token)
 // Tried in order. Only a 404 moves on to the next one.
-const REGISTER_PATHS = ['register/customer/'];
-const LOGIN_PATHS = ['/auth/login/', 'auth/token/'];
+const REGISTER_PATHS = ['auth/register/customer/'];
+const LOGIN_PATHS = ['auth/login/', 'auth/token/'];
 const REQUEST_TIMEOUT_MS = 60000;
 
 const LOGIN_ROUTE = '/login';
@@ -78,6 +82,7 @@ async function postFirstMatch(paths: string[], body: unknown, signal: AbortSigna
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify(body),
+      cache: 'no-store',
       signal,
     });
     const text = await res.text();
@@ -93,6 +98,11 @@ async function postFirstMatch(paths: string[], body: unknown, signal: AbortSigna
   }
   return last!;
 }
+
+const extractToken = (d: any): string | null => {
+  const t = d?.token ?? d?.key ?? d?.access ?? d?.tokens?.access ?? d?.data?.token ?? d?.data?.access;
+  return t ? String(t) : null;
+};
 
 // ─── SMALL UI PIECES ─────────────────────────────────────────────
 const stroke = {
@@ -218,6 +228,13 @@ export default function CustomerSignupPage() {
   const [successMsg, setSuccessMsg] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
+  const redirectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (redirectTimer.current) clearTimeout(redirectTimer.current);
+    };
+  }, []);
 
   const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
     setFormData((prev) => ({ ...prev, [e.target.name]: e.target.value }));
@@ -266,9 +283,7 @@ export default function CustomerSignupPage() {
 
       if (!res.ok) {
         if (res.status === 404) {
-          // Every candidate path returned 404: the route is missing on the backend (or the
-          // backend is not the latest deploy). The console shows each URL that was tried.
-          console.error('Signup: all register paths returned 404. Last URL:', url, 'Body:', result);
+          console.error('Signup: register route returned 404. URL:', url, 'Body:', result);
           setError(
             'Sign-up is not available right now (server route not found). Please contact support if this continues.',
           );
@@ -287,6 +302,7 @@ export default function CustomerSignupPage() {
           firstMessage(errs.non_field_errors) ||
           firstMessage(result?.detail) ||
           firstMessage(result?.error) ||
+          firstMessage(result?.message) ||
           (res.status >= 500
             ? 'Server error. Please try again in a moment.'
             : 'Could not create your account. Please try again.');
@@ -294,15 +310,17 @@ export default function CustomerSignupPage() {
       }
 
       // 1) Token in the sign-up response?
-      let token: unknown =
-        result?.token ?? result?.key ?? result?.access ?? result?.tokens?.access ?? result?.data?.token;
+      let token: string | null = extractToken(result);
       const backendUser: Record<string, unknown> =
         result?.user && typeof result.user === 'object' ? result.user : {};
-      let loginIdentifier = email;
+      let loginIdentifier = String(backendUser.username || email);
 
-      // 2) Otherwise sign in with the same credentials (email first, then derived username).
+      // 2) Otherwise sign in with the same credentials (backend username, email, then derived username).
       if (!token) {
-        for (const identifier of [email, derivedUsername]) {
+        const identifiers = Array.from(
+          new Set([String(backendUser.username || ''), email, derivedUsername].filter(Boolean)),
+        );
+        for (const identifier of identifiers) {
           try {
             const { res: loginRes, data: loginData } = await postFirstMatch(
               LOGIN_PATHS,
@@ -310,7 +328,7 @@ export default function CustomerSignupPage() {
               controller.signal,
             );
             if (loginRes.ok) {
-              token = loginData?.token ?? loginData?.key ?? loginData?.access;
+              token = extractToken(loginData);
               if (token) {
                 loginIdentifier = identifier;
                 break;
@@ -327,7 +345,7 @@ export default function CustomerSignupPage() {
       // 3) Still no token: send them to the login page.
       if (!token) {
         setSuccessMsg('Account created successfully! Please sign in to continue.');
-        setTimeout(() => router.push(LOGIN_ROUTE), 1500);
+        redirectTimer.current = setTimeout(() => router.push(LOGIN_ROUTE), 1500);
         return;
       }
 
@@ -337,9 +355,9 @@ export default function CustomerSignupPage() {
         username: backendUser.username || loginIdentifier,
         email: backendUser.email || email,
         full_name: backendUser.full_name || formData.fullName.trim(),
-        phone: backendUser.phone || formData.phone.trim(),
+        phone: backendUser.phone || finalPhone,
       };
-      saveSession(String(token), user);
+      saveSession(token, user);
 
       setSuccessMsg('Account created successfully! Welcome to Rydnow. Taking you to your dashboard ...');
       router.push(DASHBOARD_ROUTE);
