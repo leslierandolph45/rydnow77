@@ -12,7 +12,7 @@ const api = (path: string) => `${API_BASE}/${path.replace(/^\/+/, '')}`;
 
 // Tried in order. Only a 404 moves on to the next one.
 const REGISTER_PATHS = ['/api/auth/register/customer/'];
-const LOGIN_PATHS = ['/api/auth/login/', 'auth/token/'];
+const LOGIN_PATHS = ['/auth/login/', 'auth/token/'];
 const REQUEST_TIMEOUT_MS = 60000;
 
 const LOGIN_ROUTE = '/login';

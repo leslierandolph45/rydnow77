@@ -157,7 +157,7 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
       env_set: Boolean(process.env.RYDNOW_API_URL),
       health: await probe(`${BACKEND}/api/health/`),
       // A POST with an empty body should answer 400 (validation), never 404.
-      register: await probe(`${BACKEND}/api/auth/register/customer/`, 'POST'),
+      register: await probe(`${BACKEND}/auth/register/customer/`, 'POST'),
     });
   }
 
@@ -173,7 +173,7 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
   }
 
   const slash = NO_TRAILING_SLASH.has(joined) ? '' : '/';
-  const url = `${BACKEND}/api/${rest.map(encodeURIComponent).join('/')}${slash}${req.nextUrl.search}`;
+  const url = `${BACKEND}/${rest.map(encodeURIComponent).join('/')}${slash}${req.nextUrl.search}`;
 
   const headers = new Headers();
   for (const name of FORWARDED_REQUEST_HEADERS) {
