@@ -482,3 +482,6 @@ export const BACKEND_ERROR_CODES = [
 ] as const;
 export type BackendErrorCode = (typeof BACKEND_ERROR_CODES)[number];
 
+
+import { configureApi } from '@/lib/rydnow/api';
+configureApi({ timeoutMs: 60_000 });

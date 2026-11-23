@@ -1,26 +1,18 @@
 'use client';
 
-import { useState, useRef, useEffect, ReactNode } from 'react';
-import type { ChangeEvent, FormEvent } from 'react';
+import { useState } from 'react';
+import type { ChangeEvent, FormEvent, ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
+import { api as rydnow, isApiError, friendlyError } from '@/lib/rydnow/api'; // adjust the path if needed
 
-// Browser -> /api/rydnow/<path> -> Next.js proxy -> https://rydnow-backend.onrender.com/api/<path>
-// Base has NO trailing slash and api() strips leading slashes, so "//" can never appear.
-const API_BASE = '/api/rydnow';
-const api = (path: string) => `${API_BASE}/${path.replace(/^\/+/, '')}`;
+// All network calls go through lib/rydnow/api.ts:
+// Browser -> /api/rydnow/<path> -> Next.js proxy -> Django backend.
+// No backend URL, route path or timeout logic lives in this page.
 
-// Matches api/urls.py (mounted under /api/):
-//   path("auth/register/customer/", views.customer_register)
-//   path("auth/login/",             views.user_login)
-//   path("auth/token/",             obtain_auth_token)
-// Tried in order. Only a 404 moves on to the next one.
-const REGISTER_PATHS = ['auth/register/customer/'];
-const LOGIN_PATHS = ['auth/login/', 'auth/token/'];
-const REQUEST_TIMEOUT_MS = 60000;
-
-const LOGIN_ROUTE = '/login';
 const DASHBOARD_ROUTE = '/customer-dashboard/'; // change if your dashboard lives elsewhere
+
+const MIN_PASSWORD_LENGTH = 10;
 
 const BRAND = {
   navy: '#0A2342',
@@ -31,6 +23,7 @@ const BRAND = {
   success: '#10B981',
 } as const;
 
+// ─── HELPERS ─────────────────────────────────────────────────────
 const isValidGhanaNumber = (phone: string) => {
   const cleaned = phone.replace(/[\s-]/g, '');
   if (/^0[2-9]\d{8}$/.test(cleaned)) return true;
@@ -46,12 +39,11 @@ const toInternational = (phone: string) => {
   return `+233${cleaned}`;
 };
 
-const firstMessage = (v: unknown): string | null => {
-  if (Array.isArray(v)) return v.length ? String(v[0]) : null;
-  if (typeof v === 'string' && v) return v;
-  return null;
-};
-
+/**
+ * Persists the session so the dashboard can read it.
+ * Keys are kept as before so existing pages keep working.
+ * Storage can be unavailable (private mode, quota), so every write is guarded.
+ */
 const saveSession = (token: string, user: Record<string, unknown>) => {
   const entries: [string, string][] = [
     ['rydnow_token', token],
@@ -64,44 +56,9 @@ const saveSession = (token: string, user: Record<string, unknown>) => {
     try {
       localStorage.setItem(key, value);
     } catch {
-      /* storage unavailable: the user can still sign in from the login page */
+      /* storage unavailable: the dashboard will send the user to sign in */
     }
   }
-};
-
-/**
- * POST JSON to the first path that exists. A 404 means "no such route", so the next path is tried.
- * Any other status (200, 400, 401, 500...) is returned immediately.
- * Logs the exact URL and body of every 404 so the real cause is visible in the console.
- */
-async function postFirstMatch(paths: string[], body: unknown, signal: AbortSignal) {
-  let last: { res: Response; data: any; url: string } | null = null;
-  for (const path of paths) {
-    const url = api(path);
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify(body),
-      cache: 'no-store',
-      signal,
-    });
-    const text = await res.text();
-    let data: any = {};
-    try {
-      data = text ? JSON.parse(text) : {};
-    } catch {
-      data = { _nonJson: text.slice(0, 200) };
-    }
-    last = { res, data, url };
-    if (res.status !== 404) return last;
-    console.error(`[rydnow] 404 from ${url}`, data);
-  }
-  return last!;
-}
-
-const extractToken = (d: any): string | null => {
-  const t = d?.token ?? d?.key ?? d?.access ?? d?.tokens?.access ?? d?.data?.token ?? d?.data?.access;
-  return t ? String(t) : null;
 };
 
 // ─── SMALL UI PIECES ─────────────────────────────────────────────
@@ -228,31 +185,32 @@ export default function CustomerSignupPage() {
   const [successMsg, setSuccessMsg] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
-  const redirectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  useEffect(() => {
-    return () => {
-      if (redirectTimer.current) clearTimeout(redirectTimer.current);
-    };
-  }, []);
 
   const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
-    setFormData((prev) => ({ ...prev, [e.target.name]: e.target.value }));
+    const { name, value } = e.target;
+    setFormData((prev) => ({ ...prev, [name]: value }));
     setError('');
   };
 
   const handleSubmitForm = async (e: FormEvent) => {
     e.preventDefault();
-    if (loading || successMsg) return;
+    if (loading || successMsg) return; // block double submits
     setError('');
     setSuccessMsg('');
 
+    const fullName = formData.fullName.trim();
+    const email = formData.email.trim().toLowerCase();
+
+    if (!fullName) {
+      setError('Please enter your full name.');
+      return;
+    }
     if (!isValidGhanaNumber(formData.phone)) {
       setError('Enter a valid Ghanaian number, e.g. 0241234567 or +233241234567.');
       return;
     }
-    if (formData.password.length < 10) {
-      setError('Your password needs at least 10 characters.');
+    if (formData.password.length < MIN_PASSWORD_LENGTH) {
+      setError(`Your password needs at least ${MIN_PASSWORD_LENGTH} characters.`);
       return;
     }
     if (formData.password !== formData.confirmPassword) {
@@ -261,117 +219,41 @@ export default function CustomerSignupPage() {
     }
 
     setLoading(true);
-
     const finalPhone = toInternational(formData.phone);
-    const email = formData.email.trim().toLowerCase();
-    const derivedUsername = email.replace(/[^a-z0-9]/g, '_').slice(0, 150);
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
     try {
-      const { res, data: result, url } = await postFirstMatch(
-        REGISTER_PATHS,
-        {
-          full_name: formData.fullName.trim(),
-          email,
-          phone: finalPhone,
-          password: formData.password,
-        },
-        controller.signal,
-      );
+      const result = await rydnow.auth.registerCustomer({
+        full_name: fullName,
+        email,
+        phone: finalPhone,
+        password: formData.password,
+      });
 
-      if (!res.ok) {
-        if (res.status === 404) {
-          console.error('Signup: register route returned 404. URL:', url, 'Body:', result);
-          setError(
-            'Sign-up is not available right now (server route not found). Please contact support if this continues.',
-          );
-          return;
-        }
+      let token: string | undefined = result.token;
+      let user: Record<string, unknown> = (result.user as unknown as Record<string, unknown>) ?? {};
 
-        console.error('Signup response', res.status, result);
-
-        const errs = result?.errors || result || {};
-        const message =
-          firstMessage(errs.email) ||
-          firstMessage(errs.phone) ||
-          firstMessage(errs.full_name) ||
-          firstMessage(errs.password) ||
-          firstMessage(errs.username) ||
-          firstMessage(errs.non_field_errors) ||
-          firstMessage(result?.detail) ||
-          firstMessage(result?.error) ||
-          firstMessage(result?.message) ||
-          (res.status >= 500
-            ? 'Server error. Please try again in a moment.'
-            : 'Could not create your account. Please try again.');
-        throw new Error(message);
-      }
-
-      // 1) Token in the sign-up response?
-      let token: string | null = extractToken(result);
-      const backendUser: Record<string, unknown> =
-        result?.user && typeof result.user === 'object' ? result.user : {};
-      let loginIdentifier = String(backendUser.username || email);
-
-      // 2) Otherwise sign in with the same credentials (backend username, email, then derived username).
+      // Fallback: sign in if the backend did not return a token
       if (!token) {
-        const identifiers = Array.from(
-          new Set([String(backendUser.username || ''), email, derivedUsername].filter(Boolean)),
-        );
-        for (const identifier of identifiers) {
-          try {
-            const { res: loginRes, data: loginData } = await postFirstMatch(
-              LOGIN_PATHS,
-              { username: identifier, password: formData.password },
-              controller.signal,
-            );
-            if (loginRes.ok) {
-              token = extractToken(loginData);
-              if (token) {
-                loginIdentifier = identifier;
-                break;
-              }
-            } else {
-              console.error('Auto-login after signup failed', identifier, loginRes.status, loginData);
-            }
-          } catch (loginErr) {
-            if (loginErr instanceof DOMException && loginErr.name === 'AbortError') throw loginErr;
-          }
-        }
+        const login = await rydnow.auth.login(email, formData.password);
+        token = login.token;
+        user = (login.user as unknown as Record<string, unknown>) ?? {};
       }
 
-      // 3) Still no token: send them to the login page.
       if (!token) {
-        setSuccessMsg('Account created successfully! Please sign in to continue.');
-        redirectTimer.current = setTimeout(() => router.push(LOGIN_ROUTE), 1500);
-        return;
+        throw new Error('Your account was created but we could not sign you in. Please sign in from the login page.');
       }
 
-      // 4) Save the session, then go to the dashboard.
-      const user: Record<string, unknown> = {
-        ...backendUser,
-        username: backendUser.username || loginIdentifier,
-        email: backendUser.email || email,
-        full_name: backendUser.full_name || formData.fullName.trim(),
-        phone: backendUser.phone || finalPhone,
-      };
-      saveSession(token, user);
-
-      setSuccessMsg('Account created successfully! Welcome to Rydnow. Taking you to your dashboard ...');
-      router.push(DASHBOARD_ROUTE);
+      // Save the token first, then go straight to the dashboard.
+      saveSession(token, { ...user, email, full_name: fullName, phone: finalPhone });
+      setSuccessMsg('Account created! Taking you to your dashboard ...');
+      router.replace(DASHBOARD_ROUTE);
     } catch (err) {
-      const message = err instanceof Error ? err.message : '';
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        setError('The server is taking too long to respond. Please try again.');
-      } else if (err instanceof TypeError) {
-        setError('Cannot reach the server. Check your connection and try again.');
+      if (isApiError(err) && err.isRouteNotFound) {
+        setError('Sign-up is temporarily unavailable. Please try again shortly.');
       } else {
-        setError(message || 'Something went wrong. Please try again.');
+        setError(friendlyError(err, 'Could not create your account. Please try again.'));
       }
     } finally {
-      clearTimeout(timer);
       setLoading(false);
     }
   };
@@ -456,7 +338,7 @@ export default function CustomerSignupPage() {
             </div>
           )}
 
-          <form onSubmit={handleSubmitForm} className="space-y-4">
+          <form onSubmit={handleSubmitForm} className="space-y-4" noValidate={false}>
             <Field label="Full name" icon="user">
               <input
                 type="text"
@@ -522,7 +404,7 @@ export default function CustomerSignupPage() {
                   onChange={handleChange}
                   placeholder="At least 10 characters"
                   autoComplete="new-password"
-                  minLength={10}
+                  minLength={MIN_PASSWORD_LENGTH}
                   required
                   className={inputCls}
                 />

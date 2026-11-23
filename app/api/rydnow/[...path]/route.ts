@@ -16,12 +16,17 @@
  * - Multipart uploads (rider documents) pass through unchanged. Hosting body-size limits still
  *   apply (Vercel serverless: about 4.5 MB per request).
  *
- * Env (Vercel + .env.local): RYDNOW_API_URL=https://rydnow-backend.onrender.com   (no trailing /api)
+ * Env (Vercel + .env.local):
+ *   RYDNOW_API_URL=https://rydnow-backend.onrender.com   (no trailing /api)
+ *   RYDNOW_DEBUG=1                                       (optional, see below)
  *
- * Quick test after deploy:  GET /api/rydnow/_debug
- *   -> health            should be 200
- *   -> register_customer should be 400 (validation), never 404
- *   -> calculate_price   should be 400 (validation), never 404
+ * Diagnostics: GET /api/rydnow/_debug
+ *   - Available in development.
+ *   - In production it answers 404 unless RYDNOW_DEBUG=1 is set. Remove the variable when done.
+ *   - Expected results: health 200; register_customer 400 (validation), never 404;
+ *     calculate_price 400 (validation), never 404.
+ *   - While it is off, upstream details (backend URL, upstream body) are also kept out of
+ *     error responses and only written to the server logs.
  */
 import { NextResponse, type NextRequest } from 'next/server';
 
@@ -37,6 +42,8 @@ const BACKEND = (process.env.RYDNOW_API_URL || DEFAULT_BACKEND)
   .replace(/\/api$/, '');
 
 const UPSTREAM_TIMEOUT_MS = 55_000;
+const PROBE_TIMEOUT_MS = 25_000;
+const LOG_PREFIX = '[rydnow-proxy]';
 
 /** Paths (after /api/) that Django serves without a trailing slash. */
 const NO_TRAILING_SLASH = new Set(['customer/wallet']);
@@ -131,12 +138,24 @@ const FORWARDED_REQUEST_HEADERS = [
 /** content-disposition is needed for CSV exports (rider/transactions/?export=csv). */
 const FORWARDED_RESPONSE_HEADERS = ['content-type', 'retry-after', 'content-disposition'] as const;
 
+const BASE_RESPONSE_HEADERS = {
+  'cache-control': 'no-store',
+  'x-content-type-options': 'nosniff',
+} as const;
+
 interface RouteContext {
   params: Promise<{ path?: string[] }>;
 }
 
+/**
+ * The _debug endpoint and detailed upstream diagnostics are on in development,
+ * and in production only when RYDNOW_DEBUG=1. Read per request so toggling the
+ * variable and redeploying is enough.
+ */
+const isDebugEnabled = () => process.env.NODE_ENV !== 'production' || process.env.RYDNOW_DEBUG === '1';
+
 const problem = (detail: string, code: string, status: number, extra: Record<string, unknown> = {}) =>
-  NextResponse.json({ detail, code, ...extra }, { status, headers: { 'cache-control': 'no-store' } });
+  NextResponse.json({ detail, code, ...extra }, { status, headers: BASE_RESPONSE_HEADERS });
 
 /**
  * Single place that builds Django URLs, so the proxy and the _debug probes can never disagree.
@@ -154,7 +173,7 @@ async function probe(url: string, method: 'GET' | 'POST' = 'GET') {
       method,
       cache: 'no-store',
       redirect: 'manual',
-      signal: AbortSignal.timeout(25_000),
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
       ...(method === 'POST' ? { headers: { 'content-type': 'application/json' }, body: '{}' } : {}),
     });
     return {
@@ -169,33 +188,40 @@ async function probe(url: string, method: 'GET' | 'POST' = 'GET') {
   }
 }
 
+async function runDebug(req: NextRequest): Promise<Response> {
+  // Diagnostics: GET /api/rydnow/_debug
+  if (process.env.NODE_ENV === 'production' && process.env.RYDNOW_DEBUG !== '1') {
+    return problem('Not found.', 'route_not_found', 404);
+  }
+  if (req.method !== 'GET') return problem('Method not allowed.', 'method_not_allowed', 405);
+
+  const [health, registerCustomer, registerRider, calculatePrice] = await Promise.all([
+    probe(buildUpstreamUrl(['health'])),
+    // A POST with an empty body should answer 400 (validation), never 404.
+    probe(buildUpstreamUrl(['auth', 'register', 'customer']), 'POST'),
+    probe(buildUpstreamUrl(['auth', 'register', 'rider']), 'POST'),
+    probe(buildUpstreamUrl(['booking', 'calculate-price']), 'POST'),
+  ]);
+
+  return NextResponse.json(
+    {
+      proxy: 'running',
+      backend: BACKEND,
+      env_set: Boolean(process.env.RYDNOW_API_URL),
+      health,
+      register_customer: registerCustomer,
+      register_rider: registerRider,
+      calculate_price: calculatePrice,
+    },
+    { headers: BASE_RESPONSE_HEADERS },
+  );
+}
+
 async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
   const { path = [] } = await ctx.params;
   const rest = path.filter(Boolean);
 
-  // Diagnostics: GET /api/rydnow/_debug
-  if (rest.length === 1 && rest[0] === '_debug') {
-    if (req.method !== 'GET') return problem('Method not allowed.', 'method_not_allowed', 405);
-    const [health, registerCustomer, registerRider, calculatePrice] = await Promise.all([
-      probe(buildUpstreamUrl(['health'])),
-      // A POST with an empty body should answer 400 (validation), never 404.
-      probe(buildUpstreamUrl(['auth', 'register', 'customer']), 'POST'),
-      probe(buildUpstreamUrl(['auth', 'register', 'rider']), 'POST'),
-      probe(buildUpstreamUrl(['booking', 'calculate-price']), 'POST'),
-    ]);
-    return NextResponse.json(
-      {
-        proxy: 'running',
-        backend: BACKEND,
-        env_set: Boolean(process.env.RYDNOW_API_URL),
-        health,
-        register_customer: registerCustomer,
-        register_rider: registerRider,
-        calculate_price: calculatePrice,
-      },
-      { headers: { 'cache-control': 'no-store' } },
-    );
-  }
+  if (rest.length === 1 && rest[0] === '_debug') return runDebug(req);
 
   if (rest.length === 0) return problem('Not found.', 'route_not_found', 404);
   if (rest.some((s) => s === '.' || s === '..' || s.includes('/') || s.includes('\\'))) {
@@ -230,6 +256,7 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
     });
   } catch (error) {
     const timedOut = error instanceof DOMException && error.name === 'TimeoutError';
+    console.error(`${LOG_PREFIX} ${timedOut ? 'timeout' : 'unreachable'} ${req.method} ${url}`, error);
     return timedOut
       ? problem('The server took too long to respond.', 'upstream_timeout', 504)
       : problem('The server could not be reached.', 'upstream_unreachable', 502);
@@ -237,7 +264,13 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
 
   // A redirect would turn a POST into a GET and lose the body. It means a wrong URL.
   if (upstream.status >= 300 && upstream.status < 400) {
-    return problem('Unexpected redirect from the server.', 'upstream_redirect', 502, { target: url });
+    console.error(`${LOG_PREFIX} redirect ${upstream.status} ${req.method} ${url}`);
+    return problem(
+      'Unexpected redirect from the server.',
+      'upstream_redirect',
+      502,
+      isDebugEnabled() ? { target: url } : {},
+    );
   }
 
   const emptyBody = req.method === 'HEAD' || upstream.status === 204 || upstream.status === 205;
@@ -246,16 +279,29 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
   // An upstream 404 with a non-JSON body means Django has no such URL (or Render is serving
   // something else). Views that say "not found" themselves return JSON and pass through.
   if (upstream.status === 404 && !(upstream.headers.get('content-type') || '').includes('application/json')) {
-    return problem('Upstream 404 (no matching backend route)', 'upstream_404', 404, {
-      target: url,
-      method: req.method,
-      upstream_content_type: upstream.headers.get('content-type'),
-      upstream_render_routing: upstream.headers.get('x-render-routing'),
-      upstream_body: body ? new TextDecoder().decode(body).slice(0, 300) : '',
+    const upstreamBody = body ? new TextDecoder().decode(body).slice(0, 300) : '';
+    console.error(`${LOG_PREFIX} upstream 404 ${req.method} ${url}`, {
+      contentType: upstream.headers.get('content-type'),
+      renderRouting: upstream.headers.get('x-render-routing'),
+      body: upstreamBody,
     });
+    return problem(
+      'Upstream 404 (no matching backend route)',
+      'upstream_404',
+      404,
+      isDebugEnabled()
+        ? {
+            target: url,
+            method: req.method,
+            upstream_content_type: upstream.headers.get('content-type'),
+            upstream_render_routing: upstream.headers.get('x-render-routing'),
+            upstream_body: upstreamBody,
+          }
+        : {},
+    );
   }
 
-  const responseHeaders = new Headers({ 'cache-control': 'no-store' });
+  const responseHeaders = new Headers(BASE_RESPONSE_HEADERS);
   for (const name of FORWARDED_RESPONSE_HEADERS) {
     const value = upstream.headers.get(name);
     if (value) responseHeaders.set(name, value);
