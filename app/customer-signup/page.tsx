@@ -11,7 +11,7 @@ const API_BASE = '/api/rydnow';
 const api = (path: string) => `${API_BASE}/${path.replace(/^\/+/, '')}`;
 
 // Tried in order. Only a 404 moves on to the next one.
-const REGISTER_PATHS = ['auth/register/customer-dashboard/', 'auth/register/', 'register/customer/'];
+const REGISTER_PATHS = ['/api/auth/register/customer/', 'auth/register/', 'register/customer/'];
 const LOGIN_PATHS = ['auth/login/', 'auth/token/'];
 const REQUEST_TIMEOUT_MS = 60000;
 
