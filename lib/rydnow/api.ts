@@ -32,7 +32,7 @@ import {
   type ServiceKey,
   type SurgeReason,
   type VerificationStatus,
-} from "./config";
+} from "./constants";
 
 // ---------------------------------------------------------------------------
 // Public type re-exports and aliases
@@ -141,7 +141,7 @@ export const ROUTES = {
     completeRide: "complete-ride/",
     releaseBooking: "release-booking/",
   },
-} as const;
+} as const;    
 
 // ===========================================================================
 // 2. ERRORS
