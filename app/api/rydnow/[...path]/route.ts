@@ -157,7 +157,7 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
       env_set: Boolean(process.env.RYDNOW_API_URL),
       health: await probe(`${BACKEND}/api/health/`),
       // A POST with an empty body should answer 400 (validation), never 404.
-      register: await probe(`${BACKEND}/api/auth/register/customer/`, 'POST'), // connect to Django backend 
+      register: await probe(`${BACKEND}/auth/register/customer/`, 'POST'), // connect to Django backend 
     });
   }
 
