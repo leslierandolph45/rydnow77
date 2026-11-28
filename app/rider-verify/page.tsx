@@ -2,20 +2,18 @@
 
 import { useState, useRef, useEffect, useCallback, type FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
-import Link from 'next/link';
+import { RiderShell, ErrorNote, type RiderStep } from '@/components/rider/RiderShell';
 
-/* ————————————————————————— */
-/*  Config                    */
-/* ————————————————————————— */
+/* ───────────── Config ───────────── */
 
 const API_BASE = (
   process.env.NEXT_PUBLIC_API_URL ||
   process.env.NEXT_PUBLIC_API_BASE ||
   'https://rydnow-backend.onrender.com'
-);
+).replace(/\/+$/, '');
 
 const VERIFY_URL = `${API_BASE}/rider/verify/`;
-// NEW endpoint: see backend/verification_status_view.py. Must be added to urls.py.
+// Endpoint: backend/verification_status_view.py. Must be registered in urls.py.
 const STATUS_URL = `${API_BASE}/rider/verification-status/`;
 const AUTH_SCHEME = 'Token';
 
@@ -31,9 +29,7 @@ const STATUS_POLL_MS = 30000;
 const MAX_SIZE_MB = 5;
 const ALLOWED_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'application/pdf'];
 
-/* ————————————————————————— */
-/*  Types                     */
-/* ————————————————————————— */
+/* ───────────── Types ───────────── */
 
 type DocField = 'ghanaCardFront' | 'ghanaCardBack' | 'passportPhoto' | 'licenseDoc' | 'vehicleReg';
 type Files = Record<DocField, File | null>;
@@ -51,7 +47,7 @@ const DOCS: { field: DocField; label: string; desc: string; apiName: string }[] 
   { field: 'ghanaCardBack', label: 'Ghana Card (Back)', desc: 'Clear photo of the back of your card', apiName: 'ghana_card_back' },
   { field: 'passportPhoto', label: 'Passport-sized photo', desc: 'A clear, front-facing photo of your face', apiName: 'passport_photo' },
   { field: 'licenseDoc', label: 'Riding licence', desc: 'Your valid motor vehicle licence', apiName: 'riding_license' },
-  { field: 'vehicleReg', label: 'Vehicle registration', desc: 'Your motorbike registration document', apiName: 'vehicle_registration' }
+  { field: 'vehicleReg', label: 'Vehicle registration', desc: 'Your motorbike registration document', apiName: 'vehicle_registration' },
 ];
 
 const EMPTY_FILES: Files = { ghanaCardFront: null, ghanaCardBack: null, passportPhoto: null, licenseDoc: null, vehicleReg: null };
@@ -60,12 +56,10 @@ const EMPTY_STATUS: Record<DocField, Status> = {
   ghanaCardBack: 'pending',
   passportPhoto: 'pending',
   licenseDoc: 'pending',
-  vehicleReg: 'pending'
+  vehicleReg: 'pending',
 };
 
-/* ————————————————————————— */
-/*  Helpers                   */
-/* ————————————————————————— */
+/* ───────────── Helpers ───────────── */
 
 const getStored = (key: string): string | null => {
   try {
@@ -116,15 +110,13 @@ const BADGE: Record<Status, string> = {
   pending: '',
   uploading: 'Sending…',
   done: '✓ Sent',
-  error: 'Failed'
+  error: 'Failed',
 };
 
-/* ————————————————————————— */
-/*  File Upload Component     */
-/* ————————————————————————— */
+/* ───────────── Upload card ───────────── */
 
 function FileUploadBox({
-  label, desc, note, file, status, onPick, onRemove, disabled
+  label, desc, note, file, status, onPick, onRemove, disabled,
 }: {
   label: string;
   desc: string;
@@ -148,17 +140,17 @@ function FileUploadBox({
   }, [file]);
 
   const badgeText = !file ? (note ? 'Re-upload' : 'Required') : BADGE[status] || 'Ready';
-  const badgeClass = status === 'done' ? 'ok' : status === 'error' || (!file && note) ? 'err' : status === 'uploading' ? 'busy' : '';
+  const badgeClass = status === 'done' ? 'ok' : status === 'error' || (!file && note) ? 'err' : status === 'uploading' ? 'busy' : file ? 'ready' : '';
   const descText = !file
     ? (note || desc)
     : status === 'done' ? 'Sent to RYDNOW'
-    : status === 'error' ? 'Upload failed, tap Submit to retry'
+    : status === 'error' ? 'Upload failed, tap the button below to retry'
     : 'Ready to send';
 
   return (
-    <div className="rv-card">
+    <div className={`rv-card${file ? ' has-file' : ''}${status === 'error' ? ' failed' : ''}`}>
       <div className="rv-card-top">
-        <div>
+        <div className="rv-card-tx">
           <div className="rv-label">{label}</div>
           <div className="rv-desc">{descText}</div>
         </div>
@@ -191,19 +183,17 @@ function FileUploadBox({
         </div>
       ) : (
         <button type="button" className="rv-drop" onClick={() => inputRef.current?.click()} disabled={disabled}>
-          <span className="rv-plus">+</span> Upload or take photo
+          <span className="rv-plus" aria-hidden="true">+</span> Upload or take photo
         </button>
       )}
     </div>
   );
 }
 
-/* ————————————————————————— */
-/*  Status screens (Step 3)   */
-/* ————————————————————————— */
+/* ───────────── Status panels (after submit) ───────────── */
 
-function StatusScreen({
-  stage, onHome, onRefresh, refreshing
+function StatusPanel({
+  stage, onHome, onRefresh, refreshing,
 }: {
   stage: Exclude<Stage, 'not_started' | 'rejected'>;
   onHome: () => void;
@@ -212,33 +202,32 @@ function StatusScreen({
 }) {
   if (stage === 'approved') {
     return (
-      <main className="rv-wrap rv-done">
-        <div className="rv-check">✓</div>
-        <h1>You&apos;re verified</h1>
-        <p className="rv-sub">Great news! Your account is verified. Sign in and start earning.</p>
-        <button className="rv-submit" onClick={onHome}>Back to home</button>
-      </main>
+      <section className="rn-sheet rv-status">
+        <div className="rv-badge-lg">✓</div>
+        <h2>You&apos;re verified</h2>
+        <p className="rn-sheet-sub">Your account is approved. Sign in, go online and start earning.</p>
+        <button className="rn-submit" onClick={onHome}>Back to home</button>
+      </section>
     );
   }
 
   if (stage === 'suspended') {
     return (
-      <main className="rv-wrap rv-done">
-        <div className="rv-check rv-check-err">!</div>
-        <h1>Account suspended</h1>
-        <p className="rv-sub">Your rider account is suspended, so documents cannot be changed. Contact RYDNOW support for help.</p>
-        <button className="rv-submit" onClick={onHome}>Back to home</button>
-      </main>
+      <section className="rn-sheet rv-status">
+        <div className="rv-badge-lg bad">!</div>
+        <h2>Account suspended</h2>
+        <p className="rn-sheet-sub">Your rider account is suspended, so documents cannot be changed. Email support and we will explain what happens next.</p>
+        <button className="rn-submit" onClick={onHome}>Back to home</button>
+      </section>
     );
   }
 
-  // under_review = Step 3 of 3
+  // under_review
   return (
-    <main className="rv-wrap rv-done">
-      <div className="rv-check">✓</div>
-      <span className="rv-eyebrow">Step 3 of 3</span>
-      <h1>Documents submitted successfully</h1>
-      <p className="rv-sub">Your account is being reviewed. We&apos;ll email you within 24–48 hours.</p>
+    <section className="rn-sheet rv-status">
+      <div className="rv-badge-lg">✓</div>
+      <h2>Documents submitted</h2>
+      <p className="rn-sheet-sub">Your account is being reviewed. We&apos;ll email you within 24–48 hours.</p>
 
       <ol className="rv-steps">
         <li><b>We check your documents.</b> An admin verifies each one.</li>
@@ -248,17 +237,15 @@ function StatusScreen({
 
       <p className="rv-lock">Documents cannot be changed while your account is under review.</p>
 
-      <button className="rv-submit" onClick={onHome}>Back to home</button>
-      <button className="rv-ghost" onClick={onRefresh} disabled={refreshing}>
+      <button className="rn-submit" onClick={onHome}>Back to home</button>
+      <button className="rn-ghost" onClick={onRefresh} disabled={refreshing}>
         {refreshing ? 'Checking…' : 'Check status'}
       </button>
-    </main>
+    </section>
   );
 }
 
-/* ————————————————————————— */
-/*  Main Page Component       */
-/* ————————————————————————— */
+/* ───────────── Page ───────────── */
 
 export default function RiderVerifyPage() {
   const router = useRouter();
@@ -294,7 +281,7 @@ export default function RiderVerifyPage() {
     try {
       const res = await fetch(STATUS_URL, {
         headers: { Accept: 'application/json', Authorization: `${AUTH_SCHEME} ${token}` },
-        cache: 'no-store'
+        cache: 'no-store',
       });
       if (res.status === 401 || res.status === 403) {
         clearStored(TOKEN_KEY);
@@ -386,10 +373,10 @@ export default function RiderVerifyPage() {
           method: 'POST',
           headers: {
             Accept: 'application/json',
-            Authorization: `${AUTH_SCHEME} ${authToken}`
+            Authorization: `${AUTH_SCHEME} ${authToken}`,
           },
           body,
-          signal: controller.signal
+          signal: controller.signal,
         });
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') {
@@ -411,17 +398,14 @@ export default function RiderVerifyPage() {
           setUploadStatus(prev => ({ ...prev, [docField]: 'done' }));
           return true;
         }
-        const text = await response.text().catch(() => '');
-        console.error('Non-JSON response', response.status, text.slice(0, 300));
         if (response.status >= 502 && response.status <= 504) {
-          throw new Error('The server is waking up. Please tap Submit again in a few seconds.');
+          throw new Error('The server is waking up. Please tap the button again in a few seconds.');
         }
         throw new Error(`Server error (${response.status}). Please try again.`);
       }
 
       const result = await response.json().catch(() => null);
       if (!response.ok) {
-        console.error('Verify response', response.status, result);
         throw new Error(extractError(result) || 'Upload failed');
       }
 
@@ -453,7 +437,7 @@ export default function RiderVerifyPage() {
       // Keep the token so the rider can come back and see the decision.
       const synced = await refreshStatus();
       if (!synced) setStage('under_review');
-      window.scrollTo({ top: 0 });
+      document.getElementById('rn-scroll')?.scrollTo({ top: 0 });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong. Please try again.');
       // e.g. a 409 because the account is already under review: show the real state.
@@ -469,243 +453,171 @@ export default function RiderVerifyPage() {
     setRefreshing(false);
   };
 
-  // Loading state
+  /* ── Render ── */
+
+  const isResend = stage === 'rejected';
+  const isFinal = stage === 'under_review' || stage === 'approved' || stage === 'suspended';
+
+  let step: RiderStep = 2;
+  let headline = 'Show us who is riding.';
+  let lead = 'Upload five clear documents. We review them within 24–48 hours.';
   if (!ready) {
-    return (
-      <div className="rv-page">
-        <style>{css}</style>
-        <main className="rv-wrap"><p className="rv-sub">Loading…</p></main>
-      </div>
-    );
+    headline = 'Checking your account…';
+    lead = 'One moment while we load your verification status.';
+  } else if (isResend) {
+    headline = 'A few documents need another look.';
+    lead = 'Re-upload the documents below and we will review them again.';
+  } else if (stage === 'under_review') {
+    step = 3;
+    headline = 'You are in the queue.';
+    lead = 'An admin is checking your documents. You will hear from us within 24–48 hours.';
+  } else if (stage === 'approved') {
+    step = 3;
+    headline = 'You are verified. Time to ride.';
+    lead = 'Sign in, go online and take your first job.';
+  } else if (stage === 'suspended') {
+    step = 3;
+    headline = 'Your account is on hold.';
+    lead = 'Documents cannot be changed right now.';
   }
 
-  // Step 3 and final states
-  if (stage === 'under_review' || stage === 'approved' || stage === 'suspended') {
-    return (
-      <div className="rv-page">
-        <style>{css}</style>
-        <StatusScreen
-          stage={stage}
+  return (
+    <RiderShell
+      step={step}
+      allDone={stage === 'approved'}
+      headline={headline}
+      lead={lead}
+      backHref={isFinal ? HOME_PATH : SIGNUP_PATH}
+      backLabel={isFinal ? 'Home' : 'Back'}
+    >
+      <style>{verifyCss}</style>
+
+      {!ready && (
+        <section className="rn-sheet" aria-busy="true">
+          <p className="rn-sheet-sub" style={{ margin: 0 }}>Loading…</p>
+        </section>
+      )}
+
+      {ready && isFinal && (
+        <StatusPanel
+          stage={stage as Exclude<Stage, 'not_started' | 'rejected'>}
           onHome={() => router.push(HOME_PATH)}
           onRefresh={handleRefresh}
           refreshing={refreshing}
         />
-      </div>
-    );
-  }
+      )}
 
-  // Step 2: upload form (first time, or resend after rejection)
-  const isResend = stage === 'rejected';
-
-  return (
-    <div className="rv-page">
-      <style>{css}</style>
-
-      <header className="rv-nav">
-        <Link href="/" className="rv-logo">RYD<b>NOW</b></Link>
-        <Link href={SIGNUP_PATH} className="rv-back">← Back</Link>
-      </header>
-
-      <form onSubmit={handleSubmit} className="rv-wrap">
-        <span className="rv-eyebrow">{isResend ? 'Action needed' : 'Step 2 of 3'}</span>
-        {isResend && (
-          <div className="rv-error" role="alert" style={{ marginBottom: 16 }}>
-            ⚠️ Update needed: {reason || 'Please re-upload the documents below.'}
-          </div>
-        )}
-
-        <h1>{isResend ? 'We need new documents' : 'Verify your identity'}</h1>
-        <p className="rv-sub">
-          {isResend
-            ? 'We need a clearer photo. Please re-upload the documents below and we will review them again.'
-            : 'Upload these documents so we can approve your rider account.'}
-        </p>
-
-        <div className="rv-progress" role="progressbar" aria-valuemin={0} aria-valuemax={editableDocs.length} aria-valuenow={addedCount}>
-          <div style={{ width: `${editableDocs.length ? (addedCount / editableDocs.length) * 100 : 0}%` }} />
-        </div>
-        <div className="rv-count">{addedCount} of {editableDocs.length} documents added</div>
-
-        {editableDocs.map(d => (
-          <FileUploadBox
-            key={d.field}
-            label={d.label}
-            desc={d.desc}
-            note={isResend ? serverDocs[d.apiName]?.note || `Please re-upload your ${d.label}.` : ''}
-            file={files[d.field]}
-            status={uploadStatus[d.field]}
-            onPick={handlePick(d.field)}
-            onRemove={handleRemove(d.field)}
-            disabled={isSubmitting}
-          />
-        ))}
-
-        {isResend && DOCS.some(d => serverDocs[d.apiName]?.state === 'approved') && (
-          <p className="rv-note">
-            Already approved: {DOCS.filter(d => serverDocs[d.apiName]?.state === 'approved').map(d => d.label).join(', ')}.
+      {ready && !isFinal && (
+        <form onSubmit={handleSubmit} className="rn-sheet">
+          <h2>{isResend ? 'Send new documents' : 'Verify your identity'}</h2>
+          <p className="rn-sheet-sub">
+            {isResend
+              ? 'We need a clearer photo of the documents below.'
+              : 'Step 2 of 3. Take a clear photo or upload a file for each document.'}
           </p>
-        )}
 
-        <p className="rv-note">🔒 Your documents are stored securely and used only for verification. JPG, PNG, WEBP or PDF, up to {MAX_SIZE_MB} MB each.</p>
+          {isResend && (
+            <div className="rn-error" role="alert">
+              <span>Update needed: {reason || 'Please re-upload the documents below.'}</span>
+            </div>
+          )}
 
-        <div className="rv-bar">
-          {error && <div className="rv-error" role="alert">{error}</div>}
-          <button
-            type="submit"
-            disabled={isSubmitting || editableDocs.length === 0 || addedCount < editableDocs.length}
-            className="rv-submit"
+          <div
+            className="rv-progress"
+            role="progressbar"
+            aria-label="Documents added"
+            aria-valuemin={0}
+            aria-valuemax={editableDocs.length}
+            aria-valuenow={addedCount}
           >
-            {isSubmitting ? 'Submitting...' : isResend ? 'Send new documents' : 'Submit for review'}
-          </button>
-        </div>
-      </form>
-    </div>
+            <div style={{ width: `${editableDocs.length ? (addedCount / editableDocs.length) * 100 : 0}%` }} />
+          </div>
+          <div className="rv-count">{addedCount} of {editableDocs.length} documents added</div>
+
+          {editableDocs.map(d => (
+            <FileUploadBox
+              key={d.field}
+              label={d.label}
+              desc={d.desc}
+              note={isResend ? serverDocs[d.apiName]?.note || `Please re-upload your ${d.label}.` : ''}
+              file={files[d.field]}
+              status={uploadStatus[d.field]}
+              onPick={handlePick(d.field)}
+              onRemove={handleRemove(d.field)}
+              disabled={isSubmitting}
+            />
+          ))}
+
+          {isResend && DOCS.some(d => serverDocs[d.apiName]?.state === 'approved') && (
+            <p className="rv-note">
+              Already approved: {DOCS.filter(d => serverDocs[d.apiName]?.state === 'approved').map(d => d.label).join(', ')}.
+            </p>
+          )}
+
+          <p className="rv-note">
+            Your documents are stored securely and used only for verification. JPG, PNG, WEBP or PDF, up to {MAX_SIZE_MB} MB each.
+          </p>
+
+          <div className="rv-bar">
+            <ErrorNote message={error} />
+            <button
+              type="submit"
+              disabled={isSubmitting || editableDocs.length === 0 || addedCount < editableDocs.length}
+              className="rn-submit"
+            >
+              {isSubmitting ? 'Sending documents…' : isResend ? 'Send new documents' : 'Submit for review'}
+            </button>
+          </div>
+        </form>
+      )}
+    </RiderShell>
   );
 }
 
-/* ————————————————————————— */
-/*  Styles                    */
-/* ————————————————————————— */
+/* ───────────── Styles (verify-only; shared styles live in RiderShell) ───────────── */
 
-const css = `
-.rv-page {
-  --bg: #fff; --ink: #0B1540; --muted: #5B6385; --line: #E3E6F0; --field: #F2F4FA;
-  --blue: #1E3FCE; --gold: #F5B82E; --ok: #0E8A4F; --err: #B42318;
-  min-height: 100dvh; background: var(--bg); color: var(--ink);
-  font-family: Inter, -apple-system, "Segoe UI", Roboto, system-ui, sans-serif; line-height: 1.5;
-}
-@media (prefers-color-scheme: dark) {
-  .rv-page {
-    --bg: #0A0F2B; --ink: #fff; --muted: #A5ACCB; --line: #232B57; --field: #151C42;
-    --ok: #3DD68C; --err: #F87171;
-  }
-}
-.rv-page * { box-sizing: border-box; }
-.rv-nav {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 18px 20px; border-bottom: 1px solid var(--line);
-}
-.rv-logo {
-  font-weight: 900; font-style: italic; font-size: 24px; letter-spacing: -0.5px;
-  color: var(--ink); text-decoration: none;
-}
-.rv-logo b { color: var(--gold); }
-.rv-back {
-  color: var(--muted); text-decoration: none; font-size: 14px; font-weight: 600; padding: 8px 0;
-}
-.rv-wrap {
-  max-width: 440px; margin: 0 auto;
-  padding: 28px 20px calc(160px + env(safe-area-inset-bottom, 0px));
-}
-.rv-eyebrow {
-  display: inline-block; font-size: 12px; font-weight: 700;
-  letter-spacing: 0.08em; text-transform: uppercase;
-  color: var(--blue); margin-bottom: 8px;
-}
-.rv-wrap h1 {
-  font-size: 32px; line-height: 1.1; letter-spacing: -0.03em;
-  font-weight: 800; margin: 0 0 6px;
-}
-.rv-sub { color: var(--muted); margin: 0 0 20px; }
-.rv-progress {
-  height: 6px; background: var(--field); border-radius: 3px; overflow: hidden;
-}
-.rv-progress div {
-  height: 100%; background: var(--blue); border-radius: 3px; transition: width 0.25s;
-}
-.rv-count {
-  font-size: 13px; color: var(--muted); margin: 8px 0 20px; font-weight: 600;
-}
-.rv-error {
-  background: #FDECEC; border: 1px solid #F5B5B5; color: #B42318;
-  padding: 12px 16px; border-radius: 10px; margin: 0 auto 10px; max-width: 400px; font-size: 14px;
-}
-@media (prefers-color-scheme: dark) {
-  .rv-error {
-    background: #3A1216; border-color: #7F1D1D; color: #FCA5A5;
-  }
-}
-.rv-card {
-  border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 14px;
-}
-.rv-card-top {
-  display: flex; justify-content: space-between; gap: 12px;
-  align-items: flex-start; margin-bottom: 12px;
-}
-.rv-label { font-weight: 700; font-size: 16px; }
-.rv-desc { color: var(--muted); font-size: 13px; }
-.rv-badge {
-  font-size: 12px; font-weight: 700; padding: 4px 10px;
-  border-radius: 999px; background: var(--field);
-  color: var(--muted); white-space: nowrap;
-}
-.rv-badge.ok { background: var(--ok); color: #fff; }
-.rv-badge.busy { background: var(--blue); color: #fff; }
-.rv-badge.err { background: var(--err); color: #fff; }
-.rv-drop {
-  width: 100%; min-height: 56px; border: 2px dashed var(--blue);
-  background: transparent; color: var(--blue); border-radius: 10px;
-  font: inherit; font-weight: 700; font-size: 15px; cursor: pointer;
-}
-.rv-drop:disabled { opacity: 0.5; cursor: not-allowed; }
-.rv-plus { font-size: 20px; margin-right: 6px; vertical-align: -2px; }
-.rv-file { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-.rv-thumb {
-  width: 64px; height: 64px; border-radius: 10px;
-  object-fit: cover; background: var(--field); flex: none;
-}
-.rv-pdf {
-  display: grid; place-items: center; font-weight: 800;
-  color: var(--blue); font-size: 14px;
-}
-.rv-fileinfo { flex: 1; min-width: 0; }
-.rv-filename {
-  font-weight: 600; font-size: 14px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.rv-filesize { color: var(--muted); font-size: 12px; }
-.rv-actions { display: flex; gap: 8px; width: 100%; }
-.rv-actions button {
-  flex: 1; padding: 10px; border-radius: 8px; border: 1px solid var(--line);
-  background: transparent; color: var(--ink); font: inherit;
-  font-weight: 600; font-size: 14px; cursor: pointer;
-}
-.rv-actions button.rm { color: var(--err); }
-.rv-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
-.rv-note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
-.rv-bar {
-  position: fixed; left: 0; right: 0; bottom: 0;
-  padding: 12px 20px calc(12px + env(safe-area-inset-bottom, 0px));
-  background: var(--bg); border-top: 1px solid var(--line);
-}
-.rv-submit {
-  display: block; width: 100%; max-width: 400px; margin: 0 auto; padding: 16px;
-  background: var(--blue); color: #fff; border: 0; border-radius: 10px;
-  font: inherit; font-size: 16px; font-weight: 700; cursor: pointer;
-}
-.rv-submit:disabled { opacity: 0.5; cursor: not-allowed; }
-.rv-ghost {
-  display: block; width: 100%; max-width: 400px; margin: 10px auto 0; padding: 14px;
-  background: transparent; color: var(--blue); border: 1px solid var(--line); border-radius: 10px;
-  font: inherit; font-size: 15px; font-weight: 600; cursor: pointer;
-}
-.rv-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
-.rv-done { text-align: center; padding-top: 72px; padding-bottom: 56px; }
-.rv-done .rv-submit { margin-top: 24px; }
-.rv-check {
-  width: 72px; height: 72px; border-radius: 50%; background: var(--ok); color: #fff;
-  display: grid; place-items: center; font-size: 36px; font-weight: 800; margin: 0 auto 20px;
-}
-.rv-check-err { background: var(--err); }
-.rv-steps {
-  text-align: left; margin: 20px 0 0; padding: 16px 16px 16px 36px;
-  border: 1px solid var(--line); border-radius: 14px; font-size: 14px; color: var(--muted);
-}
-.rv-steps li + li { margin-top: 10px; }
-.rv-steps b { color: var(--ink); }
-.rv-lock {
-  margin: 16px 0 0; padding: 12px 14px; border-radius: 10px;
-  background: var(--field); font-size: 13px; font-weight: 600; color: var(--muted);
-}
+const verifyCss = `
+.rv-progress{height:8px;border-radius:4px;background:var(--field);overflow:hidden}
+.rv-progress div{height:100%;border-radius:4px;background:var(--orange);transition:width .25s}
+.rv-count{margin:8px 0 18px;font-size:13px;font-weight:700;color:var(--muted)}
+.rv-card{margin-bottom:14px;padding:16px;border:2px solid var(--line);border-radius:16px;background:var(--card);transition:border-color .15s}
+.rv-card.has-file{border-color:var(--navy)}
+.rv-card.failed{border-color:var(--err)}
+@media(prefers-color-scheme:dark){.rv-card.has-file{border-color:var(--orange)}}
+.rv-card-top{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:12px}
+.rv-card-tx{min-width:0}
+.rv-label{font-weight:800;font-size:16px;line-height:1.3}
+.rv-desc{color:var(--muted);font-size:13px;margin-top:2px}
+.rv-badge{flex:none;padding:5px 10px;border-radius:999px;background:var(--field);color:var(--muted);font-size:12px;font-weight:800;white-space:nowrap}
+.rv-badge.ready{background:var(--navy);color:#fff}
+.rv-badge.ok{background:var(--ok);color:#fff}
+.rv-badge.busy{background:var(--orange);color:var(--navy)}
+.rv-badge.err{background:var(--err);color:#fff}
+@media(prefers-color-scheme:dark){.rv-badge.ok,.rv-badge.err{color:#0A1224}}
+.rv-drop{width:100%;min-height:60px;border:2px dashed var(--navy);border-radius:14px;background:transparent;color:var(--ink);font:inherit;font-weight:800;font-size:15px;cursor:pointer}
+@media(prefers-color-scheme:dark){.rv-drop{border-color:var(--orange)}}
+.rv-drop:disabled{opacity:.5;cursor:not-allowed}
+.rv-plus{display:inline-grid;place-items:center;width:26px;height:26px;margin-right:8px;border-radius:50%;background:var(--orange);color:var(--navy);font-size:20px;line-height:1;vertical-align:middle}
+.rv-file{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.rv-thumb{flex:none;width:64px;height:64px;border-radius:12px;object-fit:cover;background:var(--field)}
+.rv-pdf{display:grid;place-items:center;font-weight:800;font-size:14px;color:var(--ink)}
+.rv-fileinfo{flex:1;min-width:0}
+.rv-filename{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700;font-size:14px}
+.rv-filesize{color:var(--muted);font-size:12px}
+.rv-actions{display:flex;gap:8px;width:100%}
+.rv-actions button{flex:1;min-height:46px;padding:10px;border:2px solid var(--line);border-radius:12px;background:transparent;color:var(--ink);font:inherit;font-weight:700;font-size:14px;cursor:pointer}
+.rv-actions button.rm{color:var(--err)}
+.rv-actions button:disabled{opacity:.5;cursor:not-allowed}
+.rv-note{margin:10px 0 0;color:var(--muted);font-size:12.5px}
+.rv-bar{position:sticky;bottom:0;z-index:5;margin:18px calc(var(--pad-x) * -1) calc(var(--pad-y) * -1);padding:14px var(--pad-x) calc(14px + env(safe-area-inset-bottom));background:var(--card);border-top:1px solid var(--line);border-radius:0 0 22px 22px}
+.rv-bar .rn-error{margin-bottom:10px}
+.rv-status{text-align:center}
+.rv-status .rn-submit{margin-top:20px}
+.rv-badge-lg{width:76px;height:76px;margin:4px auto 16px;border-radius:50%;display:grid;place-items:center;background:var(--orange);color:var(--navy);font-size:38px;font-weight:800}
+.rv-badge-lg.bad{background:var(--err);color:#fff}
+.rv-steps{margin:20px 0 0;padding:16px 16px 16px 36px;border:2px solid var(--line);border-radius:16px;text-align:left;font-size:14px;color:var(--muted)}
+.rv-steps li+li{margin-top:10px}
+.rv-steps b{color:var(--ink)}
+.rv-lock{margin:16px 0 0;padding:12px 14px;border-radius:12px;background:var(--field);font-size:13px;font-weight:700;color:var(--muted)}
 `;
 

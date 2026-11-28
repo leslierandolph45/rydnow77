@@ -1,62 +1,79 @@
-/**
+L/**
  * app/api/rydnow/[...path]/route.ts      (use src/app/... if your project has a src folder)
  *
- *   browser -> /api/rydnow/<path> -> this file -> <RYDNOW_API_URL>/api/<path>
+ *   browser -> /api/rydnow/<path> -> this file -> <RYDNOW_API_URL>/api/<path>/ (Django)
  *
- * Matches api/urls.py and api/booking_urls.py (auth, bookings, quotes, dispatch, rider wallet,
- * customer wallet, deposits, withdrawals, payments, profile, nearby riders).
+ * Why a proxy: the browser only talks to your own site, so there are no CORS problems and the
+ * backend address stays on the server.
  *
+ * Behaviour
  * - Every upstream URL is built under Django's /api/ namespace (see buildUpstreamUrl).
- * - Django routes end with "/" (APPEND_SLASH), so the slash is always added back. The one exception
- *   is customer/wallet, which Django serves WITHOUT a slash.
- * - Server-to-server webhooks are blocked here on purpose: the payment provider must call
+ * - Django routes end with "/" (APPEND_SLASH) and Next.js strips trailing slashes from incoming
+ *   URLs, so the slash is added back. Exception: customer/wallet, which Django serves WITHOUT one.
+ * - Only allow-listed routes are forwarded. Anything else gets a 404 from the proxy itself.
+ * - Server-to-server webhooks are blocked on purpose: the payment provider must call
  *   https://<backend>/api/booking/webhook/ and /api/payments/paystack/webhook/ directly.
- * - Needs a normal (non-static) Next.js deployment. With `output: 'export'` in next.config,
- *   API routes do not exist and every call returns 404.
+ * - Needs a normal (non-static) Next.js deployment. With `output: 'export'` API routes do not exist.
  * - Multipart uploads (rider documents) pass through unchanged. Hosting body-size limits still
  *   apply (Vercel serverless: about 4.5 MB per request).
  *
- * Env (Vercel + .env.local):
- *   RYDNOW_API_URL=https://rydnow-backend.onrender.com   (no trailing /api)
+ * Env (Vercel + .env.local, restart `npm run dev` after changing):
+ *   RYDNOW_API_URL=https://rydnow-backend.onrender.com   (no trailing slash, no /api)
  *   RYDNOW_DEBUG=1                                       (optional, see below)
  *
  * Diagnostics: GET /api/rydnow/_debug
- *   - Available in development.
- *   - In production it answers 404 unless RYDNOW_DEBUG=1 is set. Remove the variable when done.
- *   - Expected results: health 200; register_customer 400 (validation), never 404;
+ *   - Always available in development.
+ *   - In production it answers 404 unless RYDNOW_DEBUG=1. Remove the variable when done.
+ *   - Expected: health 200; register_customer 400 (validation), never 404;
  *     calculate_price 400 (validation), never 404.
- *   - While it is off, upstream details (backend URL, upstream body) are also kept out of
- *     error responses and only written to the server logs.
+ *   - While debug is off, upstream details (backend URL, upstream body) stay out of error
+ *     responses and are only written to the server logs.
  */
 import { NextResponse, type NextRequest } from 'next/server';
+
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 /** A sleeping Render instance can take a while to answer the first call. */
 export const maxDuration = 60;
 
-const DEFAULT_BACKEND = 'https://rydnow-backend.onrender.com';
-const BACKEND = (process.env.RYDNOW_API_URL || DEFAULT_BACKEND)
+
+/* -------------------------------------------------------------------------- */
+/* Configuration                                                              */
+/* -------------------------------------------------------------------------- */
+
+
+const FALLBACK_BACKEND = 'https://rydnow-backend.onrender.com';
+
+
+const BACKEND = (process.env.RYDNOW_API_URL || process.env.NEXT_PUBLIC_API_BASE || FALLBACK_BACKEND)
   .trim()
   .replace(/\/+$/, '')
   .replace(/\/api$/, '');
 
+
+/** Kept below maxDuration so we can answer with a clean 504 instead of being killed. */
 const UPSTREAM_TIMEOUT_MS = 55_000;
 const PROBE_TIMEOUT_MS = 25_000;
 const LOG_PREFIX = '[rydnow-proxy]';
 
+
 /** Paths (after /api/) that Django serves without a trailing slash. */
 const NO_TRAILING_SLASH = new Set(['customer/wallet']);
+
 
 /** Provider-to-server only. Never reachable from the browser through this proxy. */
 const BLOCKED = new Set(['booking/webhook', 'payments/paystack/webhook']);
 
+
 /** "*" matches exactly one path segment. Paths are relative to /api/, without a trailing slash. */
 const tpl = (p: string) => new RegExp('^' + p.split('*').join('[^/]+') + '$');
+
 
 const ALLOWED: RegExp[] = [
   // health
   'health',
+
 
   // pricing + bookings (booking_urls.py)
   'booking/calculate-price',
@@ -71,6 +88,7 @@ const ALLOWED: RegExp[] = [
   'booking/*/release',
   'dispatch/rider/nearby',
 
+
   // auth + registration + verification
   'auth/login',
   'auth/token',
@@ -83,9 +101,11 @@ const ALLOWED: RegExp[] = [
   'auth/me',
   'profile',
 
+
   // dispatch offers
   'rider/offers/*/accept',
   'rider/offers/*/decline',
+
 
   // rider wallet, transactions, deposits, withdrawals
   'rider/wallet',
@@ -96,21 +116,27 @@ const ALLOWED: RegExp[] = [
   'rider/deposits/*/verify',
   'rider/withdraw',
 
+
   // customer wallet (no trailing slash on the backend)
   'customer/wallet',
 
+
   // location + nearby riders
   'rider/update-location',
+  'rider/nearby',
   'riders/nearby',
+
 
   // legacy customer bookings
   'bookings',
   'bookings/*',
   'bookings/*/cancel',
 
+
   // promos
   'promos/validate',
   'promo/verify',
+
 
   // rider dashboard
   'list-bookings',
@@ -123,11 +149,14 @@ const ALLOWED: RegExp[] = [
   'complete-ride',
   'release-booking',
 
+
   // payments (Paystack): initialize + verify only; the webhook is blocked above
   'payments/initialize',
   'payments/verify',
 ].map(tpl);
 
+
+/** Only these request headers are forwarded. Cookies and the browser's Host are never sent to Django. */
 const FORWARDED_REQUEST_HEADERS = [
   'authorization',
   'content-type',
@@ -135,27 +164,38 @@ const FORWARDED_REQUEST_HEADERS = [
   'accept-language',
   'idempotency-key',
 ] as const;
+
+
 /** content-disposition is needed for CSV exports (rider/transactions/?export=csv). */
 const FORWARDED_RESPONSE_HEADERS = ['content-type', 'retry-after', 'content-disposition'] as const;
+
 
 const BASE_RESPONSE_HEADERS = {
   'cache-control': 'no-store',
   'x-content-type-options': 'nosniff',
 } as const;
 
+
 interface RouteContext {
   params: Promise<{ path?: string[] }>;
 }
 
+
+/* -------------------------------------------------------------------------- */
+/* Helpers                                                                    */
+/* -------------------------------------------------------------------------- */
+
+
 /**
- * The _debug endpoint and detailed upstream diagnostics are on in development,
- * and in production only when RYDNOW_DEBUG=1. Read per request so toggling the
- * variable and redeploying is enough.
+ * Debug output is on in development, and in production only when RYDNOW_DEBUG=1.
+ * Read per request so toggling the variable and redeploying is enough.
  */
 const isDebugEnabled = () => process.env.NODE_ENV !== 'production' || process.env.RYDNOW_DEBUG === '1';
 
+
 const problem = (detail: string, code: string, status: number, extra: Record<string, unknown> = {}) =>
   NextResponse.json({ detail, code, ...extra }, { status, headers: BASE_RESPONSE_HEADERS });
+
 
 /**
  * Single place that builds Django URLs, so the proxy and the _debug probes can never disagree.
@@ -166,6 +206,7 @@ function buildUpstreamUrl(segments: string[], search = ''): string {
   const slash = NO_TRAILING_SLASH.has(joined) ? '' : '/';
   return `${BACKEND}/api/${segments.map(encodeURIComponent).join('/')}${slash}${search}`;
 }
+
 
 async function probe(url: string, method: 'GET' | 'POST' = 'GET') {
   try {
@@ -188,12 +229,20 @@ async function probe(url: string, method: 'GET' | 'POST' = 'GET') {
   }
 }
 
+
+const isTimeoutError = (e: unknown) =>
+  e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError');
+
+
+/* -------------------------------------------------------------------------- */
+/* Diagnostics                                                                */
+/* -------------------------------------------------------------------------- */
+
+
 async function runDebug(req: NextRequest): Promise<Response> {
-  // Diagnostics: GET /api/rydnow/_debug
-  if (process.env.NODE_ENV === 'production' && process.env.RYDNOW_DEBUG !== '1') {
-    return problem('Not found.', 'route_not_found', 404);
-  }
+  if (!isDebugEnabled()) return problem('Not found.', 'route_not_found', 404);
   if (req.method !== 'GET') return problem('Method not allowed.', 'method_not_allowed', 405);
+
 
   const [health, registerCustomer, registerRider, calculatePrice] = await Promise.all([
     probe(buildUpstreamUrl(['health'])),
@@ -202,6 +251,7 @@ async function runDebug(req: NextRequest): Promise<Response> {
     probe(buildUpstreamUrl(['auth', 'register', 'rider']), 'POST'),
     probe(buildUpstreamUrl(['booking', 'calculate-price']), 'POST'),
   ]);
+
 
   return NextResponse.json(
     {
@@ -217,16 +267,25 @@ async function runDebug(req: NextRequest): Promise<Response> {
   );
 }
 
+
+/* -------------------------------------------------------------------------- */
+/* Proxy                                                                      */
+/* -------------------------------------------------------------------------- */
+
+
 async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
   const { path = [] } = await ctx.params;
   const rest = path.filter(Boolean);
 
+
   if (rest.length === 1 && rest[0] === '_debug') return runDebug(req);
+
 
   if (rest.length === 0) return problem('Not found.', 'route_not_found', 404);
   if (rest.some((s) => s === '.' || s === '..' || s.includes('/') || s.includes('\\'))) {
     return problem('Bad path.', 'bad_path', 400);
   }
+
 
   const joined = rest.join('/');
   if (BLOCKED.has(joined)) return problem('Not available through this proxy.', 'route_blocked', 403);
@@ -234,7 +293,9 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
     return problem('This API route is not exposed by the proxy.', 'route_not_allowed', 404, { path: joined });
   }
 
+
   const url = buildUpstreamUrl(rest, req.nextUrl.search);
+
 
   const headers = new Headers();
   for (const name of FORWARDED_REQUEST_HEADERS) {
@@ -242,25 +303,29 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
     if (value) headers.set(name, value);
   }
 
+
   const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+  const requestBody = hasBody ? await req.arrayBuffer() : undefined;
+
 
   let upstream: Response;
   try {
     upstream = await fetch(url, {
       method: req.method,
       headers,
-      body: hasBody ? await req.arrayBuffer() : undefined,
+      body: requestBody && requestBody.byteLength > 0 ? requestBody : undefined,
       redirect: 'manual',
       cache: 'no-store',
       signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
     });
   } catch (error) {
-    const timedOut = error instanceof DOMException && error.name === 'TimeoutError';
+    const timedOut = isTimeoutError(error);
     console.error(`${LOG_PREFIX} ${timedOut ? 'timeout' : 'unreachable'} ${req.method} ${url}`, error);
     return timedOut
-      ? problem('The server took too long to respond.', 'upstream_timeout', 504)
+      ? problem('The server took too long to respond. Please try again.', 'upstream_timeout', 504)
       : problem('The server could not be reached.', 'upstream_unreachable', 502);
   }
+
 
   // A redirect would turn a POST into a GET and lose the body. It means a wrong URL.
   if (upstream.status >= 300 && upstream.status < 400) {
@@ -273,8 +338,24 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
     );
   }
 
+
+  // 204 / 205 / HEAD must not carry a body (304 is handled above as a redirect-range status).
   const emptyBody = req.method === 'HEAD' || upstream.status === 204 || upstream.status === 205;
-  const body = emptyBody ? null : await upstream.arrayBuffer();
+
+
+  let body: ArrayBuffer | null = null;
+  if (!emptyBody) {
+    try {
+      body = await upstream.arrayBuffer();
+    } catch (error) {
+      const timedOut = isTimeoutError(error);
+      console.error(`${LOG_PREFIX} body read failed ${req.method} ${url}`, error);
+      return timedOut
+        ? problem('The server took too long to respond. Please try again.', 'upstream_timeout', 504)
+        : problem('The server could not be reached.', 'upstream_unreachable', 502);
+    }
+  }
+
 
   // An upstream 404 with a non-JSON body means Django has no such URL (or Render is serving
   // something else). Views that say "not found" themselves return JSON and pass through.
@@ -301,6 +382,7 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
     );
   }
 
+
   const responseHeaders = new Headers(BASE_RESPONSE_HEADERS);
   for (const name of FORWARDED_RESPONSE_HEADERS) {
     const value = upstream.headers.get(name);
@@ -309,10 +391,14 @@ async function proxy(req: NextRequest, ctx: RouteContext): Promise<Response> {
   return new Response(body, { status: upstream.status, headers: responseHeaders });
 }
 
+
 export const GET = proxy;
 export const HEAD = proxy;
 export const POST = proxy;
 export const PUT = proxy;
 export const PATCH = proxy;
 export const DELETE = proxy;
+
+
+
 

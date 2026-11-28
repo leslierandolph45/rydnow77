@@ -1,33 +1,77 @@
 'use client';
 
-import { useState, ReactNode } from 'react';
+
+import { useEffect, useRef, useState } from 'react';
+import type { ChangeEvent, FormEvent, KeyboardEvent, ReactNode } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
+// FIX: React components must be capitalised in JSX (<logo /> renders as an HTML tag)
+import Logo from '@/components/logo';
+import { BRAND } from '@/lib/brand';
+// FIX: save the token through session.ts so the dashboards read the same value
+import { setAuthToken, readString, writeString } from '@/lib/rydnow/session';
 
-const API_BASE = (
+
+const API_BASE =
   process.env.NEXT_PUBLIC_API_URL ||
   process.env.NEXT_PUBLIC_API_BASE ||
-  '/api/rydnow'
-) 
+  '/api/rydnow';
 const LOGIN_URL = `${API_BASE}/auth/login/`;
 const REQUEST_TIMEOUT_MS = 60000; // Render free instances can take ~50s to wake up
 
-const BRAND = {
-  navy: '#0A2342',
-  deep: '#071B32',
-  blue: '#0F52BA',
-  sky: '#3B82F6',
-  gold: '#F2A900',
-  success: '#10B981',
+
+// Every link and redirect on this page comes from here.
+// IMPORTANT: riderDashboard must match a real folder in your app directory.
+const ROUTES = {
+  back: '/signup',
+  home: '/',
+  customerSignup: '/customer-signup',
+  riderSignup: '/rider-signup',
+  customerDashboard: '/customer-dashboard',
+  riderDashboard: '/rider-dashboard',
 } as const;
 
-const ROUTES = {
-  // Original pointed "Back" at /customer-signup. The signup choice page is
-  // where people arrive from, so Back now goes there. Change if you prefer.
-  back: '/signup',
-  createAccount: '/customer-signup',
-  afterLogin: '/customer-dashboard',
+
+const SUPPORT = {
+  phoneLabel: '+233 59 411 6155',
+  phoneHref: 'tel:+233594116155',
+  email: 'support@rydnow.app',
 } as const;
+
+
+// Stored via session.ts, so the full key is "rydnow_login_role".
+const ROLE_KEY = 'login_role';
+
+
+// ─── ROLES ───────────────────────────────────────────────────────
+type Role = 'customer' | 'rider';
+const ROLE_ORDER: readonly Role[] = ['customer', 'rider'];
+
+
+const ROLES: Record<
+  Role,
+  { label: string; accent: string; heading: string; sub: string; signup: string; createLabel: string; dashboard: string }
+> = {
+  customer: {
+    label: 'Customer',
+    accent: BRAND.sky,
+    heading: 'Welcome back',
+    sub: 'Sign in to book rides and track deliveries.',
+    signup: ROUTES.customerSignup,
+    createLabel: 'Create a customer account',
+    dashboard: ROUTES.customerDashboard,
+  },
+  rider: {
+    label: 'Rider',
+    accent: BRAND.success,
+    heading: 'Ready to ride?',
+    sub: 'Sign in to go online, take jobs and track your earnings.',
+    signup: ROUTES.riderSignup,
+    createLabel: 'Become a rider',
+    dashboard: ROUTES.riderDashboard,
+  },
+};
+
 
 // ─── HELPERS ─────────────────────────────────────────────────────
 /** Walks any nested error shape and returns readable messages. */
@@ -38,6 +82,7 @@ function flatten(value: unknown): string[] {
   if (typeof value === 'object') return Object.values(value as Record<string, unknown>).flatMap(flatten);
   return [];
 }
+
 
 /** Handles {error}, {detail}, DRF {non_field_errors:[...]}, and {field:[...]} responses. */
 function extractError(data: unknown, fallback: string): string {
@@ -51,13 +96,24 @@ function extractError(data: unknown, fallback: string): string {
   return rest.length ? rest.join(' ') : fallback;
 }
 
-function safeStore(key: string, value: string) {
-  try {
-    localStorage.setItem(key, value);
-  } catch {
-    /* private mode / storage full */
+
+/** Best-effort role detection from the login response. */
+function detectRole(user: unknown): Role | null {
+  if (!user || typeof user !== 'object') return null;
+  const u = user as Record<string, unknown>;
+  for (const key of ['role', 'user_type', 'account_type', 'type']) {
+    const v = u[key];
+    if (typeof v === 'string') {
+      const s = v.toLowerCase();
+      if (s.includes('rider')) return 'rider';
+      if (s.includes('customer') || s.includes('client')) return 'customer';
+    }
   }
+  if (u.is_rider === true) return 'rider';
+  if (u.is_customer === true) return 'customer';
+  return null;
 }
+
 
 // ─── ICONS ───────────────────────────────────────────────────────
 const stroke = {
@@ -67,6 +123,7 @@ const stroke = {
   strokeLinecap: 'round' as const,
   strokeLinejoin: 'round' as const,
 };
+
 
 const icons = {
   user: (
@@ -100,7 +157,20 @@ const icons = {
       <path d="M12 7v6M12 17h.01" />
     </>
   ),
+  check: (
+    <>
+      <circle cx="12" cy="12" r="10" />
+      <path d="m8 12.5 2.8 2.8L16 9.8" />
+    </>
+  ),
+  wifiOff: (
+    <>
+      <path d="M3 3l18 18" />
+      <path d="M5 12.5a10 10 0 0 1 3.5-2M10 6.3A15 15 0 0 1 22 9.5M8.5 16a5 5 0 0 1 4-1.4M12 20h.01" />
+    </>
+  ),
 } as const;
+
 
 function Icon({ name, className = 'h-5 w-5' }: { name: keyof typeof icons; className?: string }) {
   return (
@@ -110,77 +180,159 @@ function Icon({ name, className = 'h-5 w-5' }: { name: keyof typeof icons; class
   );
 }
 
-function Logo({ large = false }: { large?: boolean }) {
-  return (
-    <span
-      className={`inline-flex items-center gap-1.5 font-black italic leading-none tracking-tighter ${
-        large ? 'text-[clamp(2rem,9vw,2.6rem)]' : 'text-[clamp(1.4rem,6vw,1.75rem)]'
-      }`}
-    >
-      <span className="text-white">RYD</span>
-      <span style={{ color: BRAND.gold }}>NOW</span>
-      <svg viewBox="0 0 24 24" className="h-[0.7em] w-[0.7em]" fill={BRAND.gold} aria-hidden>
-        <path d="M13 2 4 14h6l-1 8 9-12h-6l1-8z" />
-      </svg>
-    </span>
-  );
-}
 
 function Field({
+  id,
   label,
   icon,
+  accent,
+  error,
   trailing,
   children,
 }: {
+  id: string;
   label: string;
   icon: keyof typeof icons;
+  accent: string;
+  error?: string;
   trailing?: ReactNode;
   children: ReactNode;
 }) {
   return (
-    <label className="block">
-      <span className="mb-1.5 block text-sm font-semibold text-slate-200">{label}</span>
-      <span className="flex items-center gap-3 rounded-xl border border-slate-600/70 bg-[#13294B] px-4 transition focus-within:border-[#3B82F6] focus-within:ring-4 focus-within:ring-[#3B82F6]/25">
-        <span className="text-slate-400">
+    <div>
+      <label htmlFor={id} className="mb-1.5 block text-sm font-semibold text-slate-300">
+        {label}
+      </label>
+      <div
+        className="ryd-field flex items-center gap-3 rounded-xl border border-white/20 bg-brand-900/60 px-4 transition"
+        style={{
+          borderColor: error ? '#F87171' : undefined,
+          ['--ryd-accent' as string]: accent,
+        }}
+      >
+        <span className="text-slate-300">
           <Icon name={icon} />
         </span>
         {children}
         {trailing}
-      </span>
-    </label>
+      </div>
+      {error && (
+        <p id={`${id}-msg`} role="alert" className="mt-1.5 text-xs font-medium text-red-300">
+          {error}
+        </p>
+      )}
+    </div>
   );
 }
 
+
 const inputCls =
-  'w-full min-w-0 bg-transparent py-3.5 text-base text-white placeholder:text-slate-500 focus:outline-none';
+  'w-full min-w-0 bg-transparent py-3.5 text-base text-white placeholder:text-slate-300/60 focus:outline-none';
+
 
 // ─── PAGE ────────────────────────────────────────────────────────
 export default function LoginPage() {
   const router = useRouter();
+  const tabRefs = useRef<Record<Role, HTMLButtonElement | null>>({ customer: null, rider: null });
+
+
+  const [role, setRole] = useState<Role>('customer');
   const [formData, setFormData] = useState({ username: '', password: '' });
+  const [touched, setTouched] = useState({ username: false, password: false });
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [success, setSuccess] = useState(false);
   const [slow, setSlow] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
+  const [capsOn, setCapsOn] = useState(false);
+  const [offline, setOffline] = useState(false);
 
-  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+
+  const current = ROLES[role];
+
+
+  // Restore the last role, or honour /login?role=rider (handy for links).
+  useEffect(() => {
+    try {
+      const param = new URLSearchParams(window.location.search).get('role');
+      if (param === 'rider' || param === 'customer') {
+        setRole(param);
+        return;
+      }
+    } catch {
+      /* ignore */
+    }
+    const saved = readString(ROLE_KEY);
+    if (saved === 'rider' || saved === 'customer') setRole(saved);
+  }, []);
+
+
+  // Offline banner.
+  useEffect(() => {
+    const update = () => setOffline(!navigator.onLine);
+    update();
+    window.addEventListener('online', update);
+    window.addEventListener('offline', update);
+    return () => {
+      window.removeEventListener('online', update);
+      window.removeEventListener('offline', update);
+    };
+  }, []);
+
+
+  const selectRole = (next: Role, focus = false) => {
+    if (loading) return;
+    setRole(next);
+    setError('');
+    writeString(ROLE_KEY, next);
+    if (focus) tabRefs.current[next]?.focus();
+  };
+
+
+  const onTabKeyDown = (e: KeyboardEvent<HTMLButtonElement>) => {
+    const i = ROLE_ORDER.indexOf(role);
+    if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+      e.preventDefault();
+      const step = e.key === 'ArrowRight' ? 1 : -1;
+      selectRole(ROLE_ORDER[(i + step + ROLE_ORDER.length) % ROLE_ORDER.length], true);
+    }
+  };
+
+
+  const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
     setFormData((prev) => ({ ...prev, [e.target.name]: e.target.value }));
     setError('');
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
+
+  const usernameError = touched.username && !formData.username.trim() ? 'Enter your username or email.' : undefined;
+  const passwordError = touched.password && !formData.password ? 'Enter your password.' : undefined;
+
+
+  const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    if (loading) return;
+    if (loading || success) return;
     setError('');
+
+
+    if (!formData.username.trim() || !formData.password) {
+      setTouched({ username: true, password: true });
+      return;
+    }
+
+
     setLoading(true);
+
 
     const slowTimer = setTimeout(() => setSlow(true), 5000);
     const controller = new AbortController();
     const abortTimer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-    let success = false;
+    let ok = false;
+
 
     try {
       const identifier = formData.username.trim();
+
 
       const res = await fetch(LOGIN_URL, {
         method: 'POST',
@@ -192,23 +344,25 @@ export default function LoginPage() {
         }),
       });
 
+
       // Tolerate non-JSON responses (e.g. a server error page).
       const isJson = (res.headers.get('content-type') || '').includes('application/json');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const data: any = isJson ? await res.json().catch(() => null) : null;
 
-      // Shows the exact backend payload in DevTools > Console while you debug.
-      if (!res.ok) console.error('Login response', res.status, data);
 
       if (!res.ok) {
+        console.error('Login response', res.status, data);
         if (!isJson) {
           throw new Error(
             res.status >= 500
               ? 'Our server is having a problem. Please try again in a moment.'
-              : 'Could not reach the login service. Please try again.'
+              : 'Could not reach the login service. Please try again.',
           );
         }
         throw new Error(extractError(data, 'Login failed. Please check your credentials and try again.'));
       }
+
 
       const token: string | undefined = data?.token || data?.key || data?.access;
       if (!token) {
@@ -216,17 +370,31 @@ export default function LoginPage() {
         throw new Error('Login failed: the server did not return a session token.');
       }
 
-      // The standard DRF token endpoint returns only {token}, so fall back gracefully if there is no user object.
+
+      // The standard DRF token endpoint returns only {token}, so fall back if there is no user object.
       const user = data?.user ?? { username: identifier };
 
-      // Saved in both formats so the dashboard can find it.
-      safeStore('rydnow_token', token);
-      safeStore('rydnow_username', user.username ?? identifier);
-      safeStore('authtoken', token);
-      safeStore('currentUser', JSON.stringify(user));
 
-      success = true;
-      router.push(ROUTES.afterLogin);
+      // FIX: one helper saves the token where getAuthToken() reads it.
+      if (!setAuthToken(token)) {
+        throw new Error('Could not save your session. Check that your browser allows site storage.');
+      }
+      writeString('username', user.username ?? identifier);
+      try {
+        localStorage.setItem('currentUser', JSON.stringify(user));
+      } catch {
+        /* private mode / storage full */
+      }
+
+
+      // Prefer what the server says the account is; fall back to the selected tab.
+      const destinationRole = detectRole(user) ?? role;
+      writeString(ROLE_KEY, destinationRole);
+
+
+      ok = true;
+      setSuccess(true);
+      router.replace(ROLES[destinationRole].dashboard);
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         setError('The server is taking too long to respond. Please try again in a minute.');
@@ -240,17 +408,24 @@ export default function LoginPage() {
       clearTimeout(abortTimer);
       setSlow(false);
       // Keep the button disabled while redirecting so it can't be tapped twice.
-      if (!success) setLoading(false);
+      if (!ok) setLoading(false);
     }
   };
 
+
+  const busy = loading || success;
+
+
   return (
-    <div
-      className="min-h-[100dvh] font-sans"
-      style={{
-        background: `radial-gradient(120% 55% at 50% 0%, #12306A 0%, ${BRAND.navy} 45%, ${BRAND.deep} 100%)`,
-      }}
-    >
+    <div className="min-h-[100dvh] bg-gradient-to-b from-brand-900 via-brand-700 to-brand-600 font-sans">
+      <style>{`
+        @keyframes rydFade { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: none } }
+        .ryd-fade { animation: rydFade .3s ease-out both; }
+        .ryd-field:focus-within { border-color: var(--ryd-accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ryd-accent) 25%, transparent); }
+        @media (prefers-reduced-motion: reduce) { .ryd-fade { animation: none; } }
+      `}</style>
+
+
       <div
         className="mx-auto flex min-h-[100dvh] w-full max-w-[480px] flex-col px-5"
         style={{
@@ -263,7 +438,7 @@ export default function LoginPage() {
           <Link
             href={ROUTES.back}
             aria-label="Go back"
-            className="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white active:bg-white/20"
+            className="flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white active:bg-white/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3B82F6]"
           >
             <svg viewBox="0 0 24 24" className="h-5 w-5" {...stroke} strokeWidth={2.5} aria-hidden>
               <path d="M15 5l-7 7 7 7" />
@@ -272,113 +447,249 @@ export default function LoginPage() {
           <span className="w-10" aria-hidden />
         </header>
 
-        {/* brand block */}
-        <section className="mt-3 text-center">
-          <Link href="/" aria-label="RYDNOW home" className="inline-block">
-            <Logo large />
-          </Link>
-          <p className="mt-2 text-sm font-extrabold tracking-tight text-slate-200">Fast. Safe. Reliable.</p>
 
-          {/* vector: shield + bolt */}
-          <svg viewBox="0 0 120 120" className="mx-auto mt-4 h-[clamp(5rem,26vw,6.5rem)] w-[clamp(5rem,26vw,6.5rem)]" aria-hidden>
-            <circle cx="60" cy="60" r="56" fill={BRAND.blue} opacity="0.25" />
-            <circle cx="60" cy="60" r="42" fill={BRAND.blue} opacity="0.2" />
-            <path d="M60 18 28 30v28c0 22 14 38 32 44 18-6 32-22 32-44V30L60 18z" fill={BRAND.navy} stroke={BRAND.sky} strokeWidth="3" strokeLinejoin="round" />
+        {/* brand block */}
+        <section className="mt-2 text-center">
+          <Link href={ROUTES.home} aria-label="RYDNOW home" className="inline-block">
+            <Logo size="lg" />
+          </Link>
+          <p className="mt-2 text-sm font-extrabold tracking-tight text-slate-300">Fast. Safe. Reliable.</p>
+
+
+          <svg
+            viewBox="0 0 120 120"
+            className="mx-auto mt-4 h-[clamp(4.5rem,24vw,6rem)] w-[clamp(4.5rem,24vw,6rem)]"
+            aria-hidden
+          >
+            <circle cx="60" cy="60" r="56" fill={role === 'rider' ? BRAND.success : BRAND.blue} opacity="0.25" />
+            <circle cx="60" cy="60" r="42" fill={role === 'rider' ? BRAND.success : BRAND.blue} opacity="0.2" />
+            <path
+              d="M60 18 28 30v28c0 22 14 38 32 44 18-6 32-22 32-44V30L60 18z"
+              fill={BRAND.navy}
+              stroke={current.accent}
+              strokeWidth="3"
+              strokeLinejoin="round"
+            />
             <path d="M66 36 46 64h12l-4 20 20-30H62l4-18z" fill={BRAND.gold} />
             <circle cx="98" cy="28" r="2.5" fill="#fff" opacity="0.8" />
             <path d="M20 90l2 5 5 2-5 2-2 5-2-5-5-2 5-2z" fill="#fff" opacity="0.8" />
           </svg>
         </section>
 
+
+        {/* role switch */}
+        <div
+          role="tablist"
+          aria-label="Sign in as"
+          className="relative mt-5 grid grid-cols-2 rounded-2xl border border-white/10 bg-white/5 p-1"
+        >
+          <span
+            aria-hidden
+            className="absolute inset-y-1 left-1 w-[calc(50%-4px)] rounded-xl transition-all duration-300 motion-reduce:transition-none"
+            style={{
+              backgroundColor: current.accent,
+              transform: role === 'rider' ? 'translateX(100%)' : 'translateX(0)',
+            }}
+          />
+          {ROLE_ORDER.map((key) => {
+            const selected = role === key;
+            return (
+              <button
+                key={key}
+                ref={(el) => {
+                  tabRefs.current[key] = el;
+                }}
+                type="button"
+                role="tab"
+                id={`login-tab-${key}`}
+                aria-selected={selected}
+                aria-controls="login-panel"
+                tabIndex={selected ? 0 : -1}
+                disabled={busy}
+                onClick={() => selectRole(key)}
+                onKeyDown={onTabKeyDown}
+                className={`relative z-10 rounded-xl py-3 text-sm font-extrabold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/70 ${
+                  selected ? 'text-brand-900' : 'text-slate-300'
+                }`}
+              >
+                {ROLES[key].label}
+              </button>
+            );
+          })}
+        </div>
+
+
         {/* form card */}
-        <main className="mt-6 rounded-3xl border border-white/10 bg-white/[0.04] p-5 backdrop-blur">
-          <h1 className="text-[clamp(1.4rem,7vw,1.8rem)] font-black leading-tight tracking-tight text-white">
-            Welcome back
-          </h1>
-          <p className="mb-5 mt-1 text-[0.95rem] text-slate-300">Sign in to book rides and track deliveries.</p>
+        <main
+          id="login-panel"
+          role="tabpanel"
+          aria-labelledby={`login-tab-${role}`}
+          className="mt-4 rounded-3xl border border-white/10 bg-white/[0.04] p-5 backdrop-blur"
+        >
+          <div key={role} className="ryd-fade">
+            <h1 className="text-[clamp(1.4rem,7vw,1.8rem)] font-black leading-tight tracking-tight text-white">
+              {current.heading}
+            </h1>
+            <p className="mb-5 mt-1 text-[0.95rem] text-slate-300">{current.sub}</p>
+          </div>
 
-          {error && (
-            <div
-              role="alert"
-              className="mb-4 flex items-start gap-2.5 rounded-xl border border-red-500/60 bg-red-950/60 px-4 py-3 text-sm text-red-200"
+
+          <div aria-live="polite">
+            {offline && (
+              <div
+                role="status"
+                className="mb-4 flex items-start gap-2.5 rounded-xl border border-amber-400/50 bg-amber-950/50 px-4 py-3 text-sm text-amber-200"
+              >
+                <Icon name="wifiOff" className="mt-0.5 h-5 w-5 shrink-0" />
+                <span>You are offline. Reconnect to sign in.</span>
+              </div>
+            )}
+
+
+            {error && (
+              <div
+                role="alert"
+                className="mb-4 flex items-start gap-2.5 rounded-xl border border-red-500/60 bg-red-950/60 px-4 py-3 text-sm text-red-200"
+              >
+                <Icon name="alert" className="mt-0.5 h-5 w-5 shrink-0" />
+                <span>{error}</span>
+              </div>
+            )}
+
+
+            {success && (
+              <div
+                role="status"
+                className="mb-4 flex items-start gap-2.5 rounded-xl border border-[#10B981]/60 bg-[#10B981]/15 px-4 py-3 text-sm text-white"
+              >
+                <Icon name="check" className="mt-0.5 h-5 w-5 shrink-0" />
+                <span>Signed in! Opening your dashboard...</span>
+              </div>
+            )}
+          </div>
+
+
+          <form onSubmit={handleSubmit} className="space-y-4" noValidate>
+            <Field
+              id="username"
+              label="Username or email"
+              icon="user"
+              accent={current.accent}
+              error={usernameError}
             >
-              <Icon name="alert" className="mt-0.5 h-5 w-5 shrink-0" />
-              <span>{error}</span>
-            </div>
-          )}
-
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <Field label="Username or email" icon="user">
               <input
+                id="username"
                 type="text"
                 name="username"
                 value={formData.username}
                 onChange={handleChange}
+                onBlur={() => setTouched((t) => ({ ...t, username: true }))}
                 placeholder="Your username or email"
                 autoComplete="username"
                 autoCapitalize="none"
                 autoCorrect="off"
                 spellCheck={false}
                 required
+                disabled={busy}
+                aria-invalid={!!usernameError}
+                aria-describedby={usernameError ? 'username-msg' : undefined}
                 className={inputCls}
               />
             </Field>
 
-            <Field
-              label="Password"
-              icon="lock"
-              trailing={
-                <button
-                  type="button"
-                  onClick={() => setShowPassword((s) => !s)}
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
-                  className="-mr-2 rounded-lg p-2 text-slate-400 active:text-white"
-                >
-                  <Icon name={showPassword ? 'eyeOff' : 'eye'} />
-                </button>
-              }
-            >
-              <input
-                type={showPassword ? 'text' : 'password'}
-                name="password"
-                value={formData.password}
-                onChange={handleChange}
-                placeholder="Enter your password"
-                autoComplete="current-password"
-                required
-                className={inputCls}
-              />
-            </Field>
+
+            <div>
+              <Field
+                id="password"
+                label="Password"
+                icon="lock"
+                accent={current.accent}
+                error={passwordError}
+                trailing={
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((s) => !s)}
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    className="-mr-2 rounded-lg p-2 text-slate-300 active:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#3B82F6]"
+                  >
+                    <Icon name={showPassword ? 'eyeOff' : 'eye'} />
+                  </button>
+                }
+              >
+                <input
+                  id="password"
+                  type={showPassword ? 'text' : 'password'}
+                  name="password"
+                  value={formData.password}
+                  onChange={handleChange}
+                  onBlur={() => {
+                    setTouched((t) => ({ ...t, password: true }));
+                    setCapsOn(false);
+                  }}
+                  onKeyUp={(e) => setCapsOn(e.getModifierState('CapsLock'))}
+                  onKeyDown={(e) => setCapsOn(e.getModifierState('CapsLock'))}
+                  placeholder="Enter your password"
+                  autoComplete="current-password"
+                  required
+                  disabled={busy}
+                  aria-invalid={!!passwordError}
+                  aria-describedby={passwordError ? 'password-msg' : undefined}
+                  className={inputCls}
+                />
+              </Field>
+              {capsOn && !passwordError && (
+                <p className="mt-1.5 text-xs font-medium text-amber-300" role="status">
+                  Caps Lock is on.
+                </p>
+              )}
+            </div>
+
 
             <button
               type="submit"
-              disabled={loading}
-              className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl py-4 text-base font-black text-black transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-70"
-              style={{ backgroundColor: BRAND.gold, boxShadow: `0 10px 24px -10px ${BRAND.gold}99` }}
+              disabled={busy || offline}
+              className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-gold py-4 text-base font-black text-brand-900 shadow-lg shadow-black/20 transition active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-70 focus-visible:outline-none focus-visible:ring-4"
+              style={{ ['--tw-ring-color' as string]: `${BRAND.gold}66` }}
             >
-              {loading && (
+              {busy && (
                 <svg viewBox="0 0 24 24" className="h-5 w-5 animate-spin" fill="none" aria-hidden>
                   <circle cx="12" cy="12" r="9" stroke="currentColor" strokeWidth="3" opacity="0.25" />
                   <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
                 </svg>
               )}
-              {loading ? 'Signing in...' : 'Sign in'}
+              {success ? 'Opening dashboard...' : loading ? 'Signing in...' : `Sign in as ${current.label.toLowerCase()}`}
             </button>
 
+
             {slow && (
-              <p className="text-center text-sm text-slate-400" role="status">
+              <p className="text-center text-sm text-slate-300" role="status">
                 Waking up the server… this can take up to a minute.
               </p>
             )}
           </form>
+
+
+          {/* forgot password: no reset page is linked, so help goes to support */}
+          <p className="mt-4 text-center text-xs text-slate-300">
+            Forgot your password?{' '}
+            <a href={`mailto:${SUPPORT.email}`} className="font-semibold text-slate-300 underline underline-offset-2">
+              Email support
+            </a>{' '}
+            or{' '}
+            <a href={SUPPORT.phoneHref} className="font-semibold text-slate-300 underline underline-offset-2">
+              call {SUPPORT.phoneLabel}
+            </a>
+            .
+          </p>
         </main>
+
 
         {/* footer */}
         <footer className="mt-auto pt-8 text-center">
-          <p className="text-sm text-slate-400">
+          <p className="text-sm text-slate-300">
             New to RYDNOW?{' '}
-            <Link href={ROUTES.createAccount} className="font-bold" style={{ color: BRAND.gold }}>
-              Create an account
+            <Link href={current.signup} className="font-bold text-gold">
+              {current.createLabel}
             </Link>
           </p>
         </footer>
@@ -386,4 +697,5 @@ export default function LoginPage() {
     </div>
   );
 }
+
 

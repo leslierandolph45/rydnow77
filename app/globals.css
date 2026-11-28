@@ -1,8 +1,158 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+/*
+ * app/globals.css
+ *
+ * Global styles for RYDNOW. Mobile-first, light theme. Tailwind CSS v4.
+ */
+@import "tailwindcss";
 
-body {
-  margin: 0;
-  font-family: sans-serif;
+
+/* ═══ Theme ═══ */
+/* Keep in step with lib/brand.ts. brand-500, 600, 900, gold and success are exact; other shades are blends. */
+@theme {
+  --color-brand-50: #EFF5FF;
+  --color-brand-100: #DBE8FE;
+  --color-brand-200: #BFD6FE;
+  --color-brand-300: #93BBFD;
+  --color-brand-400: #609CFA;
+  --color-brand-500: #3B82F6;
+  --color-brand-600: #1E5EDC;
+  --color-brand-700: #184BAF;
+  --color-brand-800: #113779;
+  --color-brand-900: #0A2342;
+  --color-gold: #F9D342;
+  --color-gold-dark: #B7860B; /* gold text on white */
+  --color-success: #10B981;
 }
+
+
+/* ═══ Base ═══ */
+@layer base {
+  html {
+    color-scheme: light; /* keeps native controls light when the device is in dark mode */
+    -webkit-text-size-adjust: 100%;
+    text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+
+  body {
+    @apply bg-gray-100 text-gray-900 antialiased;
+    min-height: 100vh;
+    min-height: 100dvh; /* follows the mobile browser toolbar; 100vh above is the fallback */
+  }
+
+
+  ::selection {
+    @apply bg-brand-100 text-brand-900;
+  }
+
+
+  :focus-visible {
+    @apply outline-hidden ring-2 ring-brand-500 ring-offset-2;
+  }
+
+
+  input,
+  select,
+  textarea {
+    @apply text-base;
+  }
+
+
+  ::placeholder {
+    @apply text-gray-500;
+  }
+
+
+  /* v4 changed the default border colour to the text colour; keep the light grey. */
+  *,
+  ::before,
+  ::after,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentColor);
+  }
+
+
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
+  }
+
+
+  button,
+  [role="button"] {
+    touch-action: manipulation; /* no double-tap zoom delay on repeated taps */
+  }
+
+
+  :disabled,
+  [aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+}
+
+
+/* ═══ Utilities ═══ */
+/* Clearance for notches and the home indicator. Needs viewportFit: "cover". */
+@utility pt-safe {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+
+@utility pb-safe {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+
+/* Bottom bars and sheets: at least 1rem, more where the device needs it. */
+@utility pb-safe-4 {
+  padding-bottom: max(1rem, env(safe-area-inset-bottom, 0px));
+}
+
+
+/* ═══ Device and accessibility overrides (unlayered on purpose) ═══ */
+
+
+/*
+ * iOS Safari zooms into any field smaller than 16px. The base rule above loses to
+ * utilities such as `text-sm`, so enforce the minimum on touch devices.
+ */
+@media (pointer: coarse) {
+  input[class*="text-sm"],
+  input[class*="text-xs"],
+  select[class*="text-sm"],
+  select[class*="text-xs"],
+  textarea[class*="text-sm"],
+  textarea[class*="text-xs"] {
+    font-size: 1rem;
+  }
+}
+
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+
+  /* A frozen spinner looks like a hung app, so keep it turning, slowly. */
+  .animate-spin {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
+  }
+}
+
+

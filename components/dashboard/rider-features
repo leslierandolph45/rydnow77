@@ -1,0 +1,245 @@
+'use client';
+/**
+ * RYDNOW — new rider features (modular). Save as: components/rider-features.tsx
+ * Drop-in for app/rider-dashboard/page.tsx. Nothing in the existing page is removed.
+ * Every component takes the page's theme tokens (`k`) so the design system is unchanged.
+ * Wrap the *Panel components in the page's existing <Sheet>. Search "BACKEND:" for API hooks.
+ */
+import { useEffect, useRef, useState } from 'react';
+import { Icon, type IconName } from './icons';
+
+type K = Record<string, string>;
+type Notify = (m: string, t?: 'ok' | 'err' | 'info') => void;
+const money = (n: number) => n.toFixed(2);
+const PRESS = 'transition active:scale-[0.97] hover:brightness-95';
+const TAP = 'min-h-[44px]';
+const MIN_DEPOSIT = 50;
+const WITHDRAW_RATE = 0.85;
+const btn = (k: K) => `${TAP} rounded-full ${k.btn} px-4 text-sm font-extrabold ${PRESS}`;
+const gold = `${TAP} rounded-full bg-[#F9D342] px-4 text-sm font-extrabold text-[#0A2342] ${PRESS}`;
+const ghost = (k: K) => `${TAP} rounded-full border ${k.line} px-4 text-sm font-bold ${k.ink} ${PRESS}`;
+const L = (name: IconName, text: string) => <span className="inline-flex items-center justify-center gap-2"><Icon name={name} className="h-4 w-4 shrink-0" />{text}</span>;
+const inp = (k: K) => `${TAP} w-full rounded-xl border px-3 text-base outline-none focus:ring-2 focus:ring-[#F9D342] ${k.input}`;
+
+// ─── 1. WALLET ───
+export type Dest = { type: 'momo' | 'card'; masked: string } | null; // locked after first deposit
+export const WalletPanel = ({ k, balance, totalEarnings, dest, onDeposit, onWithdraw, notify, view }: {
+  k: K; view?: 'deposit' | 'withdraw'; balance: number; totalEarnings: number; dest: Dest; notify: Notify;
+  onDeposit: (amount: number, d: NonNullable<Dest>) => void; onWithdraw: (amount: number) => void;
+}) => {
+  const [method, setMethod] = useState<'momo' | 'card'>(dest?.type ?? 'momo');
+  const [phone, setPhone] = useState(''); const [amount, setAmount] = useState('');
+  const [card, setCard] = useState({ num: '', exp: '', cvv: '' });
+  const [confirm, setConfirm] = useState(false); const [busy, setBusy] = useState(false);
+  const withdrawable = +(balance * WITHDRAW_RATE).toFixed(2);
+  const held = +(balance - withdrawable).toFixed(2);
+  const locked = !!dest; // destination can never change
+  const show = (v: string) => !view || view === v;
+
+  const deposit = async () => {
+    const a = Number(amount);
+    if (!(a >= MIN_DEPOSIT)) return notify(`Minimum deposit is ${MIN_DEPOSIT} GHS.`, 'err');
+    let d: NonNullable<Dest>;
+    if (method === 'momo') {
+      if (!/^0\d{9}$/.test(phone)) return notify('Enter a valid 10-digit Mobile Money number.', 'err');
+      if (locked && dest!.masked !== `•••• ${phone.slice(-4)}`) return notify('Deposits must come from your saved payment method.', 'err');
+      d = { type: 'momo', masked: `•••• ${phone.slice(-4)}` };
+    } else {
+      const n = card.num.replace(/\s/g, '');
+      if (!/^\d{13,19}$/.test(n) || !/^\d{2}\/\d{2}$/.test(card.exp) || !/^\d{3,4}$/.test(card.cvv)) return notify('Check your card details.', 'err');
+      if (locked && dest!.masked !== `•••• ${n.slice(-4)}`) return notify('Deposits must come from your saved payment method.', 'err');
+      d = { type: 'card', masked: `•••• ${n.slice(-4)}` };
+    }
+    setBusy(true);
+    // BACKEND: momo → POST /wallet/deposit/momo/ (customer approves prompt on phone). card → use your gateway's hosted
+    // fields (Paystack/Flutterwave). Never send raw card numbers to your own server; this demo only keeps the last 4.
+    await new Promise(r => setTimeout(r, 900));
+    setBusy(false); onDeposit(a, d); setAmount(''); setCard({ num: '', exp: '', cvv: '' });
+    notify('Check your phone and approve the payment prompt. Deposit received.', 'ok');
+  };
+  const withdraw = async () => {
+    setBusy(true); setConfirm(false);
+    await new Promise(r => setTimeout(r, 800)); // BACKEND: POST /wallet/withdraw/ { amount } — server recomputes 85% and uses the stored destination
+    setBusy(false); onWithdraw(withdrawable); notify(`GH₵ ${money(withdrawable)} sent to ${dest!.masked}.`, 'ok');
+  };
+
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-3 gap-2 text-center">
+        {[['Available', withdrawable], ['Held (15%)', held], ['Total earnings', totalEarnings]].map(([l, v]) => (
+          <div key={l as string} className={`rounded-2xl p-3 ${k.soft}`}><p className={`text-[11px] ${k.sub}`}>{l as string}</p><p className={`text-base font-black ${k.ink}`}>GH₵ {money(v as number)}</p></div>
+        ))}
+      </div>
+      {show('withdraw') && (<>
+      <button onClick={() => (dest ? setConfirm(true) : notify('Make a deposit first. Withdrawals go back to the number or card you deposit with.', 'info'))}
+        disabled={busy || withdrawable <= 0} className={`flex w-full items-center justify-center gap-2 disabled:opacity-50 ${gold} !min-h-[52px]`}>{L('withdraw', `Withdraw Funds · GH₵ ${money(withdrawable)}`)}</button>
+      <p className={`text-xs ${k.sub}`}>Instantly withdraw 85% of your balance. 15% stays held for platform fees. {dest ? `Funds go only to ${dest.masked}.` : ''}</p>
+      {confirm && dest && (
+        <div className="rounded-2xl border-2 border-[#F9D342] p-3" role="alertdialog">
+          <p className={`text-sm font-bold ${k.ink}`}>Funds will be sent to {dest.masked}. Confirm withdrawal?</p>
+          <div className="mt-3 flex gap-3"><button onClick={() => setConfirm(false)} className={`flex-1 ${ghost(k)}`}>Cancel</button><button onClick={withdraw} className={`flex-[2] ${btn(k)}`}>Confirm</button></div>
+        </div>
+      )}
+      </>)}
+      {show('deposit') && (<>
+      <p className="flex items-start gap-2 rounded-2xl bg-amber-100 p-3 text-sm font-bold text-amber-900"><Icon name="alert" className="mt-0.5 h-4 w-4 shrink-0" /><span>Minimum deposit: {MIN_DEPOSIT} GHS (Cedis) is required to receive delivery jobs.</span></p>
+      <div className={`grid grid-cols-2 rounded-full p-1 ${k.soft}`}>
+        {([['momo', 'Mobile Money'], ['card', 'Card']] as const).map(([v, l]) => (
+          <button key={v} onClick={() => !locked && setMethod(v)} disabled={locked && dest!.type !== v} className={`${TAP} rounded-full text-xs font-bold disabled:opacity-40 ${method === v ? `${k.btn} shadow` : k.sub}`}>{L(v === 'momo' ? 'mobile' : 'card', l)}</button>
+        ))}
+      </div>
+      {method === 'momo' ? (
+        <label className="block"><span className={`mb-1 block text-xs font-semibold ${k.faint}`}>Mobile Money number</span><input type="tel" inputMode="numeric" value={phone} onChange={e => setPhone(e.target.value.replace(/\D/g, '').slice(0, 10))} placeholder="0541234567" className={inp(k)} /></label>
+      ) : (
+        <div className="space-y-2">
+          <input aria-label="Card number" inputMode="numeric" autoComplete="cc-number" placeholder="Card number" value={card.num} onChange={e => setCard(c => ({ ...c, num: e.target.value.replace(/[^\d ]/g, '').slice(0, 23) }))} className={inp(k)} />
+          <div className="flex gap-2"><input aria-label="Expiry" autoComplete="cc-exp" placeholder="MM/YY" value={card.exp} onChange={e => setCard(c => ({ ...c, exp: e.target.value.slice(0, 5) }))} className={inp(k)} /><input aria-label="CVV" type="password" inputMode="numeric" autoComplete="cc-csc" placeholder="CVV" value={card.cvv} onChange={e => setCard(c => ({ ...c, cvv: e.target.value.replace(/\D/g, '').slice(0, 4) }))} className={inp(k)} /></div>
+        </div>
+      )}
+      <label className="block"><span className={`mb-1 block text-xs font-semibold ${k.faint}`}>Amount (GH₵)</span><input type="number" inputMode="decimal" value={amount} onChange={e => setAmount(e.target.value)} placeholder={String(MIN_DEPOSIT)} className={inp(k)} /></label>
+      <button onClick={deposit} disabled={busy} className={`flex w-full items-center justify-center gap-2 disabled:opacity-60 ${btn(k)}`}>{busy ? 'Processing…' : method === 'momo' ? 'Send payment prompt' : 'Pay securely'}</button>
+      </>)}
+    </div>
+  );
+};
+
+// ─── 2. SERVICE TOGGLE ───
+export type Svc = { id: string; icon: IconName; name: string; approved: boolean };
+export const DEFAULT_SERVICES: Svc[] = [ // BACKEND: GET /rider-services/ (ServiceQualification approvals)
+  { id: 'ride', icon: 'bike', name: 'Okada / Ride-Hailing', approved: true },
+  { id: 'same', icon: 'box', name: 'Same-Day Delivery', approved: true },
+  { id: 'next', icon: 'calendar', name: 'Next-Day Delivery', approved: false },
+];
+export const ServiceToggle = ({ k, services, current, onChange, busy }: { k: K; services: Svc[]; current: string; onChange: (s: Svc) => void; busy?: boolean }) => (
+  <section className={`rounded-3xl p-4 ${k.card}`}>
+    <p className={`text-xs font-semibold ${k.faint}`}>Current service</p>
+    <p className={`mb-3 text-lg font-extrabold ${k.ink}`}>{services.find(s => s.id === current)?.name}</p>
+    <div className="space-y-2" role="radiogroup" aria-label="Service type">
+      {services.map(s => (
+        <button key={s.id} role="radio" aria-checked={current === s.id} disabled={!s.approved || busy} onClick={() => s.id !== current && onChange(s)}
+          className={`flex ${TAP} w-full items-center gap-3 rounded-2xl border-2 px-3 text-left text-sm font-bold ${current === s.id ? 'border-[#F9D342] bg-[#F9D342]/20' : k.line} ${s.approved ? k.ink : `${k.faint} opacity-60`}`}>
+          <Icon name={s.icon} className="h-5 w-5 shrink-0" /><span className="flex-1">{s.name}</span>{!s.approved && <span className="text-[11px] font-semibold">Pending admin approval</span>}
+        </button>
+      ))}
+    </div>
+  </section>
+);
+
+// ─── 3. CHAT ───
+export type Msg = { id: string; from: 'rider' | 'customer' | 'system'; text: string; at: number; read?: boolean };
+export type CustomerInfo = { name: string; photo?: string; address: string; phone: string; rating: number; trips: number };
+export const PRESETS = ['On my way 🛵', 'I’ve arrived', 'Please come outside', 'Running 5 min late', 'Delivery completed'];
+export const ChatPanel = ({ k, customer, msgs, onSend, arrived }: { k: K; customer: CustomerInfo; msgs: Msg[]; onSend: (text: string) => void; arrived?: boolean }) => {
+  const [text, setText] = useState(''); const end = useRef<HTMLDivElement>(null);
+  useEffect(() => { end.current?.scrollIntoView({ behavior: 'smooth' }); }, [msgs.length]);
+  const last = msgs[msgs.length - 1];
+  const typing = last?.from === 'rider'; // BACKEND: replace with websocket "typing" event from the customer
+  const send = (t: string) => { const v = t.trim(); if (v) { onSend(v); setText(''); } };
+  return (
+    <div className="space-y-3">
+      <div className={`flex items-center gap-3 rounded-2xl p-3 ${k.soft}`}>
+        {customer.photo ? <img src={customer.photo} alt="" className="h-12 w-12 rounded-full object-cover" /> : <span className="flex h-12 w-12 items-center justify-center rounded-full bg-[#F9D342] text-lg font-black text-[#0A2342]">{customer.name[0]}</span>}
+        <div className="min-w-0 flex-1"><p className="truncate text-sm font-extrabold">{customer.name} <span className="inline-flex items-center gap-0.5 text-xs text-emerald-500"><Icon name="check" className="h-3 w-3" />Verified</span></p>
+          <p className={`flex items-center gap-1 truncate text-xs ${k.sub}`}><Icon name="pin" className="h-3.5 w-3.5 shrink-0" />{customer.address}</p><p className={`flex items-center gap-1 text-xs ${k.sub}`}><Icon name="star" className="h-3.5 w-3.5 text-[#F9D342]" />{customer.rating} · {customer.trips} completed</p></div>
+        <a href={`tel:${customer.phone}`} aria-label={`Call ${customer.name}`} className="flex h-11 w-11 items-center justify-center rounded-full bg-emerald-500 text-white"><Icon name="phone" className="h-5 w-5" /></a>
+      </div>
+      <p className={`text-[11px] ${k.faint}`}>Phone: {customer.phone}</p>
+      {arrived && <p className="flex items-center gap-2 rounded-2xl bg-emerald-100 p-3 text-sm font-bold text-emerald-800"><Icon name="check" className="h-4 w-4 shrink-0" />You have arrived! Message the customer below to notify them</p>}
+      <div className="max-h-[38dvh] space-y-2 overflow-y-auto" aria-live="polite">
+        {msgs.map(m => m.from === 'system' ? <p key={m.id} className={`text-center text-[11px] ${k.faint}`}>{m.text}</p> : (
+          <div key={m.id} className={`flex ${m.from === 'rider' ? 'justify-end' : ''}`}>
+            <p className={`max-w-[80%] rounded-2xl px-3 py-2 text-sm ${m.from === 'rider' ? 'bg-[#F9D342] text-[#0A2342]' : k.soft}`}>{m.text}
+              {m.from === 'rider' && <span className="ml-2 text-[10px] opacity-70">{m.read ? '✓✓' : '✓'}</span>}</p>
+          </div>
+        ))}
+        {typing && <p className={`text-xs italic ${k.faint}`}>{customer.name.split(' ')[0]} is typing…</p>}
+        <div ref={end} />
+      </div>
+      <div className="-mx-1 flex gap-2 overflow-x-auto px-1">{PRESETS.map(p => <button key={p} onClick={() => send(p)} className={`${TAP} shrink-0 rounded-full border px-3 text-xs font-bold ${k.line}`}>{p}</button>)}</div>
+      <div className="flex gap-2"><input value={text} onChange={e => setText(e.target.value)} onKeyDown={e => e.key === 'Enter' && send(text)} placeholder="Type a message…" aria-label="Message" className={inp(k)} /><button onClick={() => send(text)} className={btn(k)} aria-label="Send">Send</button></div>
+    </div>
+  );
+};
+
+// ─── shared: photo picker with preview ───
+const usePhoto = () => {
+  const [file, setFile] = useState<File | null>(null); const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => () => { if (url) URL.revokeObjectURL(url); }, [url]);
+  const pick = (f?: File | null) => { if (!f) return; if (!f.type.startsWith('image/')) return false; if (url) URL.revokeObjectURL(url); setFile(f); setUrl(URL.createObjectURL(f)); return true; };
+  return { file, url, pick, clear: () => { setFile(null); setUrl(null); } };
+};
+
+// ─── 4. RIDER PROFILE PHOTO ───
+export const PhotoPanel = ({ k, current, status, onSave, notify }: { k: K; current?: string; status: 'verified' | 'pending' | 'none'; onSave: (file: File, previewUrl: string) => Promise<void>; notify: Notify }) => {
+  const p = usePhoto(); const [busy, setBusy] = useState(false);
+  return (
+    <div className="space-y-3">
+      <p className="flex items-start gap-2 rounded-2xl bg-sky-100 p-3 text-sm font-semibold text-sky-900"><Icon name="camera" className="mt-0.5 h-4 w-4 shrink-0" /><span>Clear face photo required — this helps customers identify and verify you. Must be a clear headshot with good lighting.</span></p>
+      <div className="flex items-center gap-3">
+        {(p.url || current) ? <img src={p.url || current} alt="Your profile photo" className="h-20 w-20 rounded-full object-cover" /> : <span className={`flex h-20 w-20 items-center justify-center rounded-full ${k.soft}`}><Icon name="user" className="h-9 w-9" /></span>}
+        <span className={`rounded-full px-3 py-1 text-xs font-bold ${status === 'verified' ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-800'}`}>{status === 'verified' ? 'Verified' : status === 'pending' ? 'Pending Verification' : 'No photo yet'}</span>
+      </div>
+      {!p.file ? (
+        <div className="grid grid-cols-2 gap-3">
+          <label className={`flex cursor-pointer items-center justify-center ${gold}`}>{L('camera', 'Camera')}<input type="file" accept="image/*" capture="user" className="sr-only" onChange={e => p.pick(e.target.files?.[0]) === false && notify('Please choose an image.', 'err')} /></label>
+          <label className={`flex cursor-pointer items-center justify-center ${ghost(k)}`}>{L('file', 'Gallery')}<input type="file" accept="image/*" className="sr-only" onChange={e => p.pick(e.target.files?.[0]) === false && notify('Please choose an image.', 'err')} /></label>
+        </div>
+      ) : (
+        <div className="flex gap-3"><button onClick={p.clear} disabled={busy} className={`flex-1 ${ghost(k)}`}>Retake</button>
+          <button disabled={busy} onClick={async () => { setBusy(true); try { await onSave(p.file!, p.url!); p.clear(); notify('Photo submitted for verification.', 'ok'); } catch { notify('We couldn’t upload your photo. Please try again.', 'err'); } finally { setBusy(false); } }} className={`flex-[2] disabled:opacity-60 ${btn(k)}`}>{busy ? 'Uploading…' : 'Confirm & save'}</button></div>
+      )}
+      <p className={`text-xs ${k.faint}`}>Customers see your photo in job details, chat and active delivery status.</p>
+    </div>
+  );
+};
+
+// ─── 5. PROOF OF DELIVERY ───
+export const ProofPanel = ({ k, onSubmit, notify }: { k: K; onSubmit: (proof: { file?: File; code?: string }) => Promise<void>; notify: Notify }) => {
+  const p = usePhoto(); const [mode, setMode] = useState<'photo' | 'scan'>('photo'); const [code, setCode] = useState(''); const [busy, setBusy] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null); const [scanning, setScanning] = useState(false);
+  const canScan = typeof window !== 'undefined' && 'BarcodeDetector' in window;
+
+  useEffect(() => {
+    if (!scanning) return;
+    let stop = false; let stream: MediaStream | null = null;
+    (async () => {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+        if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const det = new (window as any).BarcodeDetector({ formats: ['qr_code', 'code_128', 'ean_13', 'code_39'] });
+        while (!stop) {
+          const r = videoRef.current ? await det.detect(videoRef.current).catch(() => []) : [];
+          if (r.length) { setCode(r[0].rawValue); setScanning(false); break; }
+          await new Promise(res => setTimeout(res, 300));
+        }
+      } catch { notify('Camera unavailable. Type the code instead.', 'err'); setScanning(false); }
+    })();
+    return () => { stop = true; stream?.getTracks().forEach(t => t.stop()); };
+  }, [scanning, notify]);
+
+  const ready = mode === 'photo' ? !!p.file : code.trim().length >= 3;
+  const submit = async () => {
+    setBusy(true);
+    try { await onSubmit(mode === 'photo' ? { file: p.file! } : { code: code.trim() }); } // BACKEND: POST /complete-ride/ multipart {proof_image | proof_code}; store privately, link to job
+    catch { notify('We couldn’t submit your proof. Please try again.', 'err'); } finally { setBusy(false); }
+  };
+  return (
+    <div className="space-y-3">
+      <p className="flex items-start gap-2 rounded-2xl bg-amber-100 p-3 text-sm font-bold text-amber-900"><Icon name="camera" className="mt-0.5 h-4 w-4 shrink-0" /><span>Confirm Delivery — Take Photo or Scan to Submit Proof</span></p>
+      <div className={`grid grid-cols-2 rounded-full p-1 ${k.soft}`}>{([['photo', 'Take Photo', 'camera'], ['scan', 'Scan QR / Barcode', 'receipt']] as const).map(([v, l, ic]) => <button key={v} onClick={() => setMode(v)} className={`${TAP} rounded-full text-xs font-bold ${mode === v ? `${k.btn} shadow` : k.sub}`}>{L(ic, l)}</button>)}</div>
+      {mode === 'photo' ? (p.url ? (
+        <div className="space-y-2"><img src={p.url} alt="Delivery proof preview" className="max-h-64 w-full rounded-2xl object-cover" /><button onClick={p.clear} className={`w-full ${ghost(k)}`}>Retake</button></div>
+      ) : <label className={`flex cursor-pointer items-center justify-center ${gold}`}>{L('camera', 'Open camera')}<input type="file" accept="image/*" capture="environment" className="sr-only" onChange={e => p.pick(e.target.files?.[0]) === false && notify('Please choose an image.', 'err')} /></label>
+      ) : (
+        <div className="space-y-2">
+          {scanning && <video ref={videoRef} muted playsInline className="h-56 w-full rounded-2xl bg-black object-cover" />}
+          {canScan && <button onClick={() => setScanning(s => !s)} className={`w-full ${gold}`}>{scanning ? 'Stop scanning' : L('camera', 'Scan code')}</button>}
+          <input value={code} onChange={e => setCode(e.target.value)} placeholder={canScan ? 'Scanned or typed code' : 'Scanning isn’t supported here. Type the code'} aria-label="Delivery code" className={inp(k)} />
+        </div>
+      )}
+      <button onClick={submit} disabled={!ready || busy} className={`w-full disabled:opacity-50 ${btn(k)}`}>{busy ? 'Submitting…' : 'Submit Proof & Complete Delivery'}</button>
+    </div>
+  );
+};
+

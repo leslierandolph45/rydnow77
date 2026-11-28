@@ -1,543 +1,247 @@
 'use client';
-/* eslint-disable @typescript-eslint/no-explicit-any */
 
 /**
- * RYDNOW — Rider dashboard (mobile-first, Tailwind only, no custom CSS)
+ * RYDNOW — Rider Dashboard v3 (mobile-first, Tailwind only, no custom CSS)
+ * Save as: app/rider-dashboard/page.tsx   (also needs components/rider-features.tsx)
  *
- * Setup (once):   npm i leaflet && npm i -D @types/leaflet
- *   .env.local:   NEXT_PUBLIC_API_URL=https://your-backend/api
- *                 NEXT_PUBLIC_SUPPORT_PHONE=0300000000   (optional)
- *                 NEXT_PUBLIC_SEARCH_AREA="Accra, Ghana" (optional, used when geocoding addresses)
- *   app/layout.tsx: export const viewport = { width: 'device-width', initialScale: 1, viewportFit: 'cover' }
- *                   (needed so the safe-area padding works on notched phones)
+ * Layout:  fixed header · 3 tabs (Home / Jobs / Account) · fixed Go Online bar · bottom tab bar
+ * Home:    sync status · service toggle · guidelines · map + hot zones · job/offer · daily goal · milestones
+ *          · peak hours · shift analytics · weather & demand
+ * Jobs:    Earnings (donut, payout, 7-day bars, per-trip breakdown, filters) | Performance (ratings, rates)
+ * Account: wallet · profile photo · details · vehicles · documents · safety centre · schedule · achievements
+ *          · settings (theme) · security · help centre · support
+ * Sheets:  notifications · safety centre · badge · goal · password · 2FA · add vehicle · chat · photo · proof of delivery
  *
- * Backend contracts (NEW ones are optional and fail silently if missing):
- *   GET   PROFILE_PATH (/auth/me/)     -> { rider_id, name, email, phone, rating, completed_jobs, status, referral_code,
- *                                          vehicle_plate, photo_url, member_since?, acceptance_rate?, completion_rate?,
- *                                          // status in RESTRICTED_STATUSES blocks access; status in UNVERIFIED_STATUSES = still being reviewed
- *                                          services: [{ key, approved, active }] }
- *   PATCH PROFILE_PATH                 -> { online } | { active_services: [...] } | { name, phone, email }
- *   GET   /get-rider-wallet/?rider_id=     /rider-transactions/?rider_id=
- *   POST  /request-withdrawal/         -> { rider_id, amount, mobile_money_number, network }
- *   POST  /rider-deposit/              -> Mobile Money: { rider_id, amount, method: 'mobile_money', mobile_money_number, network }
- *                                         Card: { rider_id, amount, method: 'card', callback_url } -> must answer { authorization_url }
- *                                         (hosted checkout, so card numbers never touch this app)
- *   GET   /list-bookings/
- *   POST  /accept-booking/  /arrive-ride/  /start-ride/  /complete-ride/   -> { booking_id, rider_id }
- *   POST  /decline-booking/            -> { booking_id, rider_id, reason }   (also sent on timeout)
- *   POST  /update-rider-location/      -> { rider_id, latitude, longitude, is_online, booking_id? }
- *   GET   /rider-notifications/        -> { notifications: [{ id, type, title, message, created_at, is_read }] }
- *   GET   /rider-referrals/?rider_id=  -> { total, pending, earned }
- *   POST  /rider-service-request/      -> { rider_id, service }
- *
- * IMPORTANT: the wallet rule, verification check and service eligibility are enforced here for UX only.
- * accept-booking MUST enforce all of them on the server too.
- * Session: the token is read from sessionStorage first (legacy localStorage is still read so current logins keep working).
+ * ALL DATA IS MOCK. Search for "BACKEND:" to find every place to connect your API.
+ * Logo: default export from @/components/logo.
  */
 
-import Image from 'next/image';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useRouter } from 'next/navigation';
-import { Plus_Jakarta_Sans, Sora } from 'next/font/google';
-import 'leaflet/dist/leaflet.css';
-
-const bodyFont = Plus_Jakarta_Sans({ subsets: ['latin'], display: 'swap' });
-const displayFont = Sora({ subsets: ['latin'], display: 'swap' });
-const DISPLAY = displayFont.className;
-
-// ─── CONFIG ───
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'https://rydnow-backend.onrender.com';
-const AUTH_SCHEME = 'Token'; // use 'Bearer' if your backend uses JWT
-const SUPPORT_PHONE = process.env.NEXT_PUBLIC_SUPPORT_PHONE || '';
-const SEARCH_AREA = process.env.NEXT_PUBLIC_SEARCH_AREA || 'Accra, Ghana';
-const PROFILE_PATH = '/auth/me/';
-const DEFAULT_CENTER = { lat: 5.6037, lon: -0.187 }; // Accra
-const LOGIN_PATH = '/login';
-const RIDER_SIGNUP_PATH = '/rider-signup';
-const CUSTOMER_SIGNUP_PATH = '/signup';
-const PRIVACY_PATH = '/privacy';
-const TERMS_PATH = '/terms';
-const REQUEST_TIMEOUT_MS = 30_000; // generous: free-tier hosts can take a while to wake up
-
-// ─── BUSINESS RULES — EDIT ANYTIME ───
-const MIN_WALLET_BALANCE = 50; // ₵ that must stay in the wallet to accept jobs
-const DEFAULT_COMMISSION = 0.15; // used only if the backend sends no commission_rate
-const ALERT_SECONDS = 20;
-const MAX_PICKUP_KM = 10;
-const DEFAULT_DAILY_GOAL = 150;
-const MAX_RATING = 6; // 6-star rating system
-const RESTRICTED_STATUSES = ['restricted', 'suspended', 'banned', 'blocked', 'deactivated', 'disabled']; // set by admin
-// Riders whose documents are still being checked. Remove entries here if your backend uses these words for approved riders.
-const UNVERIFIED_STATUSES = ['pending', 'pending_review', 'under_review', 'unverified', 'incomplete', 'rejected'];
-const LOCATION_STALE_MS = 60_000;
-const GPS_IDLE_MS = 20_000; // location refresh while online
-const GPS_TRIP_MS = 7_000; // location refresh during a trip
-const RIDER_INVITE_REWARD = 20;
-const CUSTOMER_INVITE_REWARD = 5;
-const CUSTOMER_FRIEND_DISCOUNT = 10;
-
-// ─── SERVICES ───
-type ServiceKey = 'okada' | 'parcel' | 'waste-bin';
-const ALL_SERVICE_KEYS: ServiceKey[] = ['okada', 'parcel', 'waste-bin'];
-const SERVICE_META: Record<ServiceKey, { label: string; tagline: string; icon: string }> = {
-  okada: { label: 'Okada Ride', tagline: 'Carry passengers', icon: '/okada-one.png' },
-  parcel: { label: 'Delivery', tagline: 'Parcels, food, documents', icon: '/d.png' },
-  'waste-bin': { label: 'Waste Collection', tagline: 'Pickup & disposal', icon: '/binman.png' },
-};
-const normalizeService = (raw: unknown): ServiceKey => {
-  const k = String(raw || '').toLowerCase();
-  if (k.includes('parcel') || k.includes('deliver')) return 'parcel';
-  if (k.includes('waste')) return 'waste-bin';
-  return 'okada';
-};
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import Logo from '@/components/logo';
+import { Icon, type IconName } from '@/components/icons';
+import { WalletPanel, ServiceToggle, ChatPanel, PhotoPanel, ProofPanel, DEFAULT_SERVICES, type Dest, type Msg } from '@/components/rider-features';
 
 // ─── TYPES ───
-type LatLon = { lat: number; lon: number };
-type DepositMethod = 'mobile_money' | 'card';
-type TabType = 'home' | 'trips' | 'wallet' | 'alerts' | 'profile';
-type LocationStatus = 'idle' | 'requesting' | 'granted' | 'denied' | 'error';
-type ProfileState = 'loading' | 'ready' | 'unlinked' | 'unauth';
-type ToastType = 'success' | 'error' | 'info';
-type Network = 'MTN' | 'Telecel' | 'AirtelTigo' | '';
-type Period = 'today' | 'week' | 'month' | 'all';
-type NoteKind = 'job' | 'cancelled' | 'payment' | 'account' | 'system';
+type Tab = 'home' | 'jobs' | 'account';
+type Period = 'today' | 'week' | 'month';
+type ThemePref = 'light' | 'dark' | 'system';
+type DocStatus = 'verified' | 'pending' | 'action';
+type Stage = 'pickup' | 'arrived' | 'trip';
+type TxFilter = 'all' | 'cash' | 'online' | 'bonus' | 'fee';
+type Pay = 'cash' | 'online';
+type Job = { id: string; at: number; from: string; to: string; base: number; fee: number; bonus: number; method: Pay; km: number; proof?: string };
+type Offer = { customer: string; from: string; to: string; fare: number; km: number; method: Pay };
+type Doc = { name: string; status: DocStatus; note: string };
+type Sched = { on: boolean; from: number; to: number };
+type NoteGroup = 'jobs' | 'earnings' | 'system' | 'promos';
+type Note = { id: string; group: NoteGroup; icon: string; title: string; msg: string; at: number; read: boolean; action?: string };
+type Txn = { id: string; kind: 'deposit' | 'withdraw' | 'earning'; label: string; amount: number; at: number };
+type Vehicle = { id: string; model: string; plate: string; color: string; active: boolean; status: DocStatus; service: string; kmLeft: number };
 
-type Booking = {
-  id: string | number;
-  service_type: string;
-  pickup: string;
-  destination: string;
-  pickup_lat?: number | string;
-  pickup_lng?: number | string;
-  destination_lat?: number | string;
-  destination_lng?: number | string;
-  status: string;
-  total_amount?: number | string;
-  price?: number | string;
-  payment_method?: string;
-  delivery_category?: string | null;
-  parcel_details?: string;
-  customer_name?: string;
-  customer_phone?: string;
-  created_at?: string;
-  rider?: number | string | { id: number } | null;
+// ─── THEME TOKENS ───
+const LIGHT = {
+  page: 'bg-[#F5F7FA]', card: 'bg-white ring-1 ring-[#0A2342]/5 shadow-[0_6px_24px_rgba(10,35,66,0.08)]', ink: 'text-[#0A2342]', sub: 'text-[#0A2342]/65',
+  faint: 'text-[#0A2342]/50', line: 'border-[#0A2342]/10', soft: 'bg-[#0A2342]/5', input: 'bg-white border-[#0A2342]/20 text-[#0A2342]',
+  hero: 'bg-[#0A2342] text-white', btn: 'bg-[#0A2342] text-[#F9D342]', nav: 'bg-white/95', skel: 'bg-[#0A2342]/10', divide: 'divide-[#0A2342]/5',
+  bar: 'bg-[#0A2342]/80', sheet: 'bg-white', stroke: '#0A2342', map: 'bg-[#E8EEF5]', road: '#fff',
 };
-type RiderService = { key: ServiceKey; approved: boolean; active: boolean };
-type RiderProfile = {
-  rider_id?: string;
-  name: string;
-  email: string;
-  phone: string;
-  rating: number;
-  completed_jobs: number;
-  status?: string;
-  referral_code?: string;
-  vehicle_plate?: string;
-  photo_url?: string;
-  member_since?: string;
-  acceptance_rate?: number;
-  completion_rate?: number;
-  services: RiderService[];
+const DARK: typeof LIGHT = {
+  page: 'bg-[#06101F]', card: 'bg-[#0E2240] ring-1 ring-white/10 shadow-[0_6px_24px_rgba(0,0,0,0.45)]', ink: 'text-white', sub: 'text-white/70',
+  faint: 'text-white/55', line: 'border-white/10', soft: 'bg-white/10', input: 'bg-[#0A1A33] border-white/25 text-white',
+  hero: 'bg-[#14396B] text-white', btn: 'bg-[#F9D342] text-[#0A2342]', nav: 'bg-[#0A1A33]/95', skel: 'bg-white/10', divide: 'divide-white/10',
+  bar: 'bg-[#6FA8FF]', sheet: 'bg-[#0E2240]', stroke: '#FFFFFF', map: 'bg-[#10294A]', road: '#1D3E6B',
 };
-type WalletData = { balance: number; total_earned: number; total_withdrawn: number; commission_rate: string };
-type Transaction = {
-  id: string;
-  type: string;
-  amount?: number;
-  commission?: number;
-  rider_amount?: number;
-  status?: string;
-  description?: string;
-  created_at: string;
-};
-type Note = { id: string; kind: NoteKind; title: string; body: string; created_at: string; read: boolean; tab?: TabType };
-type Prefs = { sound: boolean; vibration: boolean; jobAlerts: boolean };
-type Summary = { service: string; pickup: string; destination: string; km?: number; min?: number; fare: number; earn: number };
+type Theme = typeof LIGHT;
 
-const EMPTY_PROFILE: RiderProfile = {
-  name: 'Rydnow Rider',
-  email: '',
-  phone: '',
-  rating: 0,
-  completed_jobs: 0,
-  services: [],
-};
-const NO_NOTES: Note[] = [];
-const LANGUAGES = ['English', 'Twi', 'Ga', 'Ewe', 'Hausa'];
-const DEFAULT_COMMISSION_LABEL = `${Math.round(DEFAULT_COMMISSION * 100)}%`;
+// ─── MOCK DATA (BACKEND: replace with API responses) ───
+const HOUR = 3600_000;
+const now = Date.now();
+const MOCK_RIDER = { name: 'Kofi Mensah', phone: '0541234567', email: 'kofi.mensah@example.com', walletBalance: 142.5, dailyGoal: 150, streakDays: 4 }; // BACKEND: GET /auth/me/ + /get-rider-wallet/
+const MOCK_DOCS: Doc[] = [
+  { name: 'Driver’s licence', status: 'verified', note: 'Expires Mar 2028' },
+  { name: 'Ghana Card', status: 'verified', note: 'Matched with your selfie' },
+  { name: 'Vehicle insurance', status: 'pending', note: 'We’re reviewing this, usually 24 hrs' },
+];
+const MOCK_VEHICLES: Vehicle[] = [
+  { id: 'v1', model: 'Haojue 125cc Okada', plate: 'GR 4821-24', color: 'Red', active: true, status: 'verified', service: '2026-12-15', kmLeft: 300 },
+  { id: 'v2', model: 'Yamaha Crux', plate: 'GN 2210-23', color: 'Black', active: false, status: 'verified', service: '2027-01-20', kmLeft: 1200 },
+]; // BACKEND: GET /rider-vehicles/
+const MOCK_HISTORY: Job[] = [
+  { id: 'J-1042', at: now - 2 * HOUR, from: 'Madina Market', to: 'Legon Campus', base: 22, fee: 3.3, bonus: 0, method: 'cash', km: 6.2 },
+  { id: 'J-1041', at: now - 4 * HOUR, from: 'Accra Mall', to: 'East Legon', base: 30, fee: 4.5, bonus: 5, method: 'online', km: 9.1 },
+  { id: 'J-1038', at: now - 26 * HOUR, from: 'Osu Oxford St', to: 'Labone', base: 18, fee: 2.7, bonus: 0, method: 'online', km: 4 },
+  { id: 'J-1035', at: now - 50 * HOUR, from: 'Circle', to: 'Kaneshie', base: 25, fee: 3.75, bonus: 0, method: 'cash', km: 7 },
+  { id: 'J-1031', at: now - 74 * HOUR, from: 'Tema Station', to: 'Ashaiman', base: 40, fee: 6, bonus: 5, method: 'cash', km: 14 },
+  { id: 'J-1027', at: now - 120 * HOUR, from: 'Spintex Rd', to: 'Airport', base: 55, fee: 8.25, bonus: 0, method: 'online', km: 21 },
+  { id: 'J-1012', at: now - 300 * HOUR, from: 'Dansoman', to: 'Mallam', base: 28, fee: 4.2, bonus: 0, method: 'online', km: 9 },
+];
+const MOCK_OFFER: Offer = { customer: 'Ama B.', from: 'Accra Mall', to: 'Osu Oxford St', fare: 35, km: 8.4, method: 'cash' };
+const MOCK_CUSTOMER = { phone: '0201234567', rating: 4.9, trips: 58 }; // BACKEND: customer profile (photo, address, phone, stats) comes with the booking
+const MOCK_NOTES: Note[] = [
+  { id: 'n1', group: 'jobs', icon: '🛵', title: 'Busy at Accra Mall', msg: 'Several requests waiting near you.', at: now - 8 * 60000, read: false, action: 'Go There' },
+  { id: 'n2', group: 'earnings', icon: '💰', title: 'Bonus earned +GH₵ 5', msg: 'Peak-hour bonus added to trip J-1041.', at: now - 4 * HOUR, read: false, action: 'View' },
+  { id: 'n3', group: 'system', icon: '📄', title: 'Insurance under review', msg: 'We’ll let you know once it’s approved.', at: now - 20 * HOUR, read: true, action: 'View' },
+  { id: 'n4', group: 'promos', icon: '🎁', title: 'Refer a rider, earn GH₵ 20', msg: 'Share your code from the Invite screen.', at: now - 40 * HOUR, read: true },
+];
+const RATINGS = { avg: 4.8, total: 312, dist: [248, 46, 12, 4, 2], acceptance: 92, response: 96, cancel: 3, dAcc: 2, dResp: 1, dCancel: -1 }; // dist = 5★..1★. BACKEND: GET /rider-performance/
+const ANALYTICS = { perHr: 24.5, platformPerHr: 21, onlineHrs: 28.5, earningHrs: 21, km: 126 }; // BACKEND: GET /rider-analytics/
+const DEMAND = [35, 85, 90, 55, 35, 30, 32, 38, 40, 45, 60, 92, 95, 85, 45, 30, 20]; // demand index for 06:00–22:00
+const HOT_ZONES = ['Accra Mall', 'Madina', 'Circle']; // BACKEND: demand heat from bookings
+const PEAK = { from: 18, to: 21, boost: 20 };
+const WEATHER = { temp: 29, cond: 'Partly cloudy', rainFrom: '4 PM', rainTo: '7 PM' }; // BACKEND: weather API
+const SUPPORT_PHONE = '0300000000';
+const EMERGENCY = { name: 'Abena (sister)', phone: '0244000000', national: '112' }; // BACKEND: rider-set emergency contact
+const CHECKIN_MS = 15 * 60_000; // safety check-in prompt interval during a trip
+const MIN_DEPOSIT = 50; // GHS needed to receive delivery jobs
+const BADGES = [
+  { id: 'first', icon: '🥇', name: 'First Trip', desc: 'Complete your first trip.', at: '2026-09-14', cur: 1, target: 1, unit: 'trip' },
+  { id: 'star', icon: '⭐', name: '5-Star Rider', desc: 'Get 10+ perfect ratings.', at: '2026-10-20', cur: 10, target: 10, unit: 'ratings' },
+  { id: 'hundred', icon: '💯', name: '100 Trips', desc: 'Complete 100 trips.', at: '2026-11-28', cur: 100, target: 100, unit: 'trips' },
+  { id: 'streak', icon: '🔥', name: '7-Day Streak', desc: 'Ride 7 days in a row.', at: null, cur: 4, target: 7, unit: 'days' },
+  { id: 'fast', icon: '⚡', name: 'Fast Responder', desc: 'Accept requests within 10 s on average.', at: null, cur: 12, target: 20, unit: 'trips' },
+  { id: 'night', icon: '🌙', name: 'Night Rider', desc: 'Complete 20+ evening trips.', at: null, cur: 6, target: 20, unit: 'trips' },
+]; // BACKEND: GET /rider-badges/
+const GUIDELINES = [
+  ['⏱️', 'Be on time', 'Reach the pickup within the ETA. Wait up to 5 minutes before cancelling.'],
+  ['🚫', 'Cancel rarely', 'Frequent cancellations lower your rating and the jobs you see.'],
+  ['🛵', 'Keep your bike ready', 'Clean, fuelled, working lights, and a spare helmet for the passenger.'],
+  ['💵', 'Confirm payment', 'For cash jobs, collect the exact fare. For online jobs, never ask for extra.'],
+];
+const SAFETY_TIPS = [
+  'Share your trip with someone you trust on longer or late-night rides.',
+  'Always wear your helmet and give your passenger one.',
+  'Park in well-lit places while waiting. Trust your instincts and cancel if a pickup feels unsafe.',
+  'Confirm the customer’s name before they board.',
+  'Keep your phone charged and your emergency contact up to date.',
+];
+const HELP = [
+  { cat: 'Getting Started', q: 'How do I start receiving jobs?', a: 'Tap GO ONLINE at the bottom of the screen. Turn on location and make sure none of your documents say Action needed.' },
+  { cat: 'Getting Started', q: 'How do goals and bonuses work?', a: 'Finish a milestone before its countdown ends and the bonus is added to your wallet.' },
+  { cat: 'Payments', q: 'When do I get paid?', a: 'Online earnings are paid out weekly to your Mobile Money number. Cash is yours as soon as you collect it.' },
+  { cat: 'Payments', q: 'What is the service fee?', a: 'A small share of each fare. You can see it on every trip under Jobs, in the trip breakdown.' },
+  { cat: 'Payments', q: 'How do withdrawals work?', a: 'Tap Withdraw Funds in your wallet to instantly take 85% of your balance. 15% stays held. Money only goes back to the number or card you deposited with.' },
+  { cat: 'Documents & Verification', q: 'How long does verification take?', a: 'Usually within 24 hours. We’ll send a notification when each document is approved.' },
+  { cat: 'Documents & Verification', q: 'A document says Action needed', a: 'Re-upload a clear photo with all four corners visible. Your account unlocks once it’s approved.' },
+  { cat: 'Vehicle Info', q: 'Can I use more than one bike?', a: 'Yes. Add a vehicle in Account, upload its documents, then tap Set as active once it’s verified.' },
+  { cat: 'Safety & Support', q: 'What does the emergency button do?', a: 'It calls your emergency contact and opens WhatsApp with your location ready to send.' },
+  { cat: 'Safety & Support', q: 'How do I contact support?', a: 'Use Call or WhatsApp in the Support card at the bottom of Account.' },
+];
+const HELP_CATS = ['Payments', 'Documents & Verification', 'Vehicle Info', 'Safety & Support', 'Getting Started'];
+const MOCK_SESSIONS = [
+  { id: 's1', device: 'This phone · Chrome', where: 'Accra, GH', seen: 'Active now', current: true },
+  { id: 's2', device: 'iPhone 12 · Safari', where: 'Tema, GH', seen: '2 days ago', current: false },
+  { id: 's3', device: 'Windows PC · Edge', where: 'Kumasi, GH', seen: '9 days ago', current: false },
+]; // BACKEND: GET /auth/sessions/
+const DEFAULT_SCHED: Sched[] = [
+  { on: true, from: 7, to: 18 }, { on: true, from: 7, to: 18 }, { on: true, from: 7, to: 18 }, { on: false, from: 7, to: 18 },
+  { on: true, from: 17, to: 22 }, { on: true, from: 17, to: 22 }, { on: false, from: 17, to: 22 },
+];
+const ACTUAL_HRS = [9, 10, 8, 0, 4, 0, 0]; // hours actually ridden Mon..Sun this week. BACKEND: derive from online sessions
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 // ─── HELPERS ───
-const money = (n: number) => (Number.isFinite(n) ? n : 0).toFixed(2);
-const round2 = (n: number) => Math.round(n * 100) / 100;
-
-const readJSON = <T,>(key: string, fallback: T): T => {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as T) : fallback;
-  } catch {
-    return fallback;
+const money = (n: number) => n.toFixed(2);
+const netOf = (j: Job) => j.base - j.fee + j.bonus;
+const todayKey = () => new Date().toISOString().slice(0, 10);
+const startOfDay = (t = Date.now()) => new Date(new Date(t).setHours(0, 0, 0, 0)).getTime();
+const periodStart = (p: Period) => (p === 'today' ? startOfDay() : p === 'week' ? startOfDay() - 6 * 24 * HOUR : new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime());
+const fmtDate = (t: number | string) => new Date(t).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' });
+const fmtFull = (t: string) => new Date(t).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+const fmtHM = (ms: number) => { const m = Math.floor(ms / 60000); return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`; };
+const ago = (t: number) => { const s = Math.max(0, Math.round((Date.now() - t) / 1000)); return s < 10 ? 'just now' : s < 60 ? `${s}s ago` : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : fmtDate(t); };
+const h12 = (h: number) => `${h % 12 || 12}${h < 12 || h === 24 ? 'AM' : 'PM'}`;
+const weekEnd = () => { const d = new Date(); d.setDate(d.getDate() + ((7 - d.getDay()) % 7)); d.setHours(23, 59, 59, 0); return d.getTime(); };
+const nextFriday = () => { const d = new Date(); d.setDate(d.getDate() + (((5 - d.getDay() + 7) % 7) || 7)); return d.getTime(); };
+const summarize = (s: Sched[]) => {
+  const out: string[] = [];
+  for (let i = 0; i < 7; i++) {
+    if (!s[i].on) continue;
+    let j = i;
+    while (j + 1 < 7 && s[j + 1].on && s[j + 1].from === s[i].from && s[j + 1].to === s[i].to) j++;
+    out.push(`${i === j ? DAYS[i] : `${DAYS[i]}–${DAYS[j]}`} ${h12(s[i].from)}–${h12(s[i].to)}`);
+    i = j;
   }
+  return out.length ? `I ride: ${out.join(', ')}` : 'No rides scheduled';
 };
-const writeJSON = (key: string, value: unknown) => {
-  try {
-    localStorage.setItem(key, JSON.stringify(value));
-  } catch {
-    /* non-critical */
-  }
-};
-
-const toLatLon = (lat: unknown, lon: unknown): LatLon | null => {
-  const a = Number(lat);
-  const b = Number(lon);
-  return lat !== undefined && lat !== null && lat !== '' && Number.isFinite(a) && Number.isFinite(b) ? { lat: a, lon: b } : null;
+const strength = (p: string) => [p.length >= 8, /[a-z]/.test(p) && /[A-Z]/.test(p), /\d/.test(p), /[^A-Za-z0-9]/.test(p)].filter(Boolean).length;
+const store = {
+  get: (k: string) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k: string, v: string) => { try { localStorage.setItem(k, v); } catch { /* non-critical */ } },
 };
 
-const distanceKm = (a: LatLon, b: LatLon) => {
-  const R = 6371;
-  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
-  const dLon = ((b.lon - a.lon) * Math.PI) / 180;
-  const x = Math.sin(dLat / 2) ** 2 + Math.cos((a.lat * Math.PI) / 180) * Math.cos((b.lat * Math.PI) / 180) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(x));
+const PRESS = 'transition active:scale-[0.97] hover:brightness-95';
+const TAP = 'min-h-[44px]';
+const BADGE: Record<DocStatus, { label: string; cls: string; icon: IconName }> = {
+  verified: { label: 'Verified', cls: 'bg-emerald-100 text-emerald-700', icon: 'check' },
+  pending: { label: 'Pending', cls: 'bg-amber-100 text-amber-800', icon: 'clock' },
+  action: { label: 'Action needed', cls: 'bg-red-100 text-red-700', icon: 'alert' },
 };
 
-const TOKEN_KEYS = ['rydnow_token', 'authToken'];
-const getToken = () => {
-  if (typeof window === 'undefined') return '';
-  for (const k of TOKEN_KEYS) {
-    const v = sessionStorage.getItem(k) || localStorage.getItem(k);
-    if (v) return v;
-  }
-  return '';
-};
-const clearSession = () => {
-  TOKEN_KEYS.forEach(k => {
-    sessionStorage.removeItem(k);
-    localStorage.removeItem(k);
-  });
-  localStorage.removeItem('rydn_rider');
-  localStorage.removeItem('rydn_notes');
-};
+const NOTE_ICON: Record<NoteGroup, IconName> = { jobs: 'bike', earnings: 'wallet', system: 'file', promos: 'star' };
+const L = (name: IconName, text: ReactNode) => <span className="inline-flex items-center justify-center gap-1.5"><Icon name={name} className="h-4 w-4 shrink-0" />{text}</span>;
 
-// Every request has a timeout so a dead connection never leaves a button spinning forever
-const api = async (path: string, init: RequestInit = {}) => {
-  const token = getToken();
-  const isForm = typeof FormData !== 'undefined' && init.body instanceof FormData;
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
-  try {
-    return await fetch(`${API_BASE}${path}`, {
-      ...init,
-      signal: init.signal ?? ctrl.signal,
-      headers: {
-        ...(isForm ? {} : { 'Content-Type': 'application/json' }),
-        ...(token ? { Authorization: `${AUTH_SCHEME} ${token}` } : {}),
-        ...(init.headers || {}),
-      },
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-};
+// ─── SMALL COMPONENTS ───
+const Spinner = ({ cls = 'h-5 w-5' }: { cls?: string }) => <span className={`inline-block ${cls} animate-spin rounded-full border-2 border-current border-t-transparent`} role="status" aria-label="Loading" />;
 
-const riderOf = (j: Booking) => String(typeof j.rider === 'object' && j.rider ? (j.rider as any).id : j.rider ?? '');
-
-const fareOf = (j: Booking) => Number(j.total_amount || j.price || 0) || 0;
-
-const normalizeGhPhone = (raw: string) => {
-  const d = raw.replace(/\D/g, '');
-  if (d.startsWith('233')) return `0${d.slice(3)}`;
-  if (d.length === 9) return `0${d}`;
-  return d;
-};
-const isValidMomo = (raw: string) => /^0\d{9}$/.test(normalizeGhPhone(raw));
-const detectNetwork = (raw: string): Network => {
-  const p = normalizeGhPhone(raw).slice(0, 3);
-  if (['024', '054', '055', '059', '053', '025'].includes(p)) return 'MTN';
-  if (['020', '050'].includes(p)) return 'Telecel';
-  if (['026', '056', '027', '057'].includes(p)) return 'AirtelTigo';
-  return '';
-};
-const whatsappLink = (raw: string) => `https://wa.me/233${normalizeGhPhone(raw).slice(1)}`;
-const googleNav = (t: LatLon | null, address: string) =>
-  t
-    ? `https://www.google.com/maps/dir/?api=1&destination=${t.lat},${t.lon}&travelmode=driving`
-    : `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(`${address}, ${SEARCH_AREA}`)}&travelmode=driving`;
-const wazeNav = (t: LatLon) => `https://waze.com/ul?ll=${t.lat},${t.lon}&navigate=yes`;
-
-// Fallback only. Prefer the server-issued referral_code: this hash can collide and is guessable.
-const makeReferralCode = (seed: string) => {
-  let h = 0;
-  for (const ch of seed) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
-  return `RYD-${h.toString(36).toUpperCase().padStart(5, '0').slice(-5)}`;
-};
-
-const startOfToday = () => {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d.getTime();
-};
-const periodStart = (p: Period) => {
-  if (p === 'today') return startOfToday();
-  if (p === 'week') return Date.now() - 7 * 86400000;
-  if (p === 'month') {
-    const d = new Date();
-    return new Date(d.getFullYear(), d.getMonth(), 1).getTime();
-  }
-  return 0;
-};
-const PERIOD_LABEL: Record<Period, string> = { today: 'Today', week: 'This week', month: 'This month', all: 'All time' };
-const shortDate = (iso?: string) => (iso ? new Date(iso).toLocaleDateString('en-GH', { day: 'numeric', month: 'short' }) : '');
-const timeAgo = (iso: string) => {
-  const m = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
-  if (m < 1) return 'Just now';
-  if (m < 60) return `${m} min ago`;
-  if (m < 1440) return `${Math.round(m / 60)} h ago`;
-  return shortDate(iso);
-};
-
-// NOTE: public Nominatim / OSRM / OSM tiles are for light use only. Move to a paid provider before launch.
-const geocode = async (address: string): Promise<LatLon | null> => {
-  try {
-    const res = await fetch(
-      `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(`${address}, ${SEARCH_AREA}`)}&limit=1&countrycodes=GH`
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    return data[0] ? toLatLon(data[0].lat, data[0].lon) : null;
-  } catch {
-    return null;
-  }
-};
-
-const getRoute = async (from: LatLon, to: LatLon) => {
-  try {
-    const res = await fetch(
-      `https://router.project-osrm.org/route/v1/driving/${from.lon},${from.lat};${to.lon},${to.lat}?overview=full&geometries=geojson`
-    );
-    if (!res.ok) return null;
-    const r = (await res.json()).routes?.[0];
-    if (!r) return null;
-    return {
-      km: Math.round((r.distance / 1000) * 10) / 10,
-      min: Math.max(1, Math.round(r.duration / 60)),
-      coords: (r.geometry?.coordinates || []).map((c: [number, number]) => [c[1], c[0]]) as [number, number][],
-    };
-  } catch {
-    return null;
-  }
-};
-
-const mapRiderProfile = (d: any, prev: Partial<RiderProfile>): RiderProfile => {
-  const services: RiderService[] = Array.isArray(d.services)
-    ? d.services.map((s: any) =>
-        typeof s === 'string'
-          ? { key: normalizeService(s), approved: true, active: true }
-          : {
-              key: normalizeService(s.key ?? s.service ?? s.slug ?? s.name),
-              approved: s.approved ?? s.is_approved ?? true,
-              active: s.active ?? s.is_active ?? true,
-            }
-      )
-    : prev.services || [];
-  return {
-    rider_id: String(d.rider_id ?? d.id ?? '') || undefined,
-    name: d.name ?? d.full_name ?? prev.name ?? 'Rydnow Rider',
-    email: d.email ?? prev.email ?? '',
-    phone: d.phone ?? d.phone_number ?? prev.phone ?? '',
-    rating: Number(d.rating ?? prev.rating ?? 0) || 0,
-    completed_jobs: Number(d.completed_jobs ?? prev.completed_jobs ?? 0),
-    status: d.status ?? d.verification_status ?? prev.status,
-    referral_code: d.referral_code ?? d.rider_code ?? prev.referral_code,
-    vehicle_plate: d.vehicle_plate ?? d.plate_number ?? prev.vehicle_plate,
-    photo_url: d.photo_url ?? d.profile_photo ?? d.photo ?? prev.photo_url,
-    member_since: d.member_since ?? d.created_at ?? prev.member_since,
-    acceptance_rate: d.acceptance_rate != null ? Number(d.acceptance_rate) : prev.acceptance_rate,
-    completion_rate: d.completion_rate != null ? Number(d.completion_rate) : prev.completion_rate,
-    services,
-  };
-};
-
-const normalizeWallet = (d: any): WalletData => ({
-  balance: Number(d.balance ?? d.available_balance ?? 0) || 0,
-  total_earned: Number(d.total_earned ?? 0) || 0,
-  total_withdrawn: Number(d.total_withdrawn ?? 0) || 0,
-  commission_rate: String(d.commission_rate ?? DEFAULT_COMMISSION_LABEL),
-});
-
-const CREDIT_TYPES = ['deposit', 'job_payment', 'referral_bonus', 'bonus', 'tip', 'refund'];
-const TX_LABEL: Record<string, string> = {
-  deposit: 'Wallet deposit',
-  job_payment: 'Trip earnings',
-  withdrawal: 'Withdrawal',
-  commission: 'Service fee',
-  referral_bonus: 'Referral bonus',
-  bonus: 'Bonus',
-  tip: 'Tip',
-  refund: 'Refund',
-};
-const txAmount = (tx: Transaction) => Math.abs(Number(tx.rider_amount || tx.amount || 0));
-const txIsCredit = (tx: Transaction) => CREDIT_TYPES.includes(tx.type);
-
-const alertRider = (prefs: Prefs) => {
-  if (prefs.vibration) {
-    try {
-      navigator.vibrate?.([220, 100, 220, 100, 220]);
-    } catch {
-      /* ignore */
-    }
-  }
-  if (!prefs.sound) return;
-  try {
-    const C = window.AudioContext || (window as any).webkitAudioContext;
-    const ctx = new C();
-    const o = ctx.createOscillator();
-    const g = ctx.createGain();
-    o.connect(g);
-    g.connect(ctx.destination);
-    o.frequency.value = 880;
-    g.gain.value = 0.1;
-    o.start();
-    setTimeout(() => {
-      o.stop();
-      ctx.close();
-    }, 300);
-  } catch {
-    /* browsers may block sound until the first tap */
-  }
-};
-
-// ─── DESIGN TOKENS (Tailwind class strings) ───
-const CARD = 'rounded-3xl border border-white/10 bg-white/[0.045] shadow-[0_10px_40px_rgba(0,0,0,0.35)] backdrop-blur-xl';
-const BTN_PRIMARY =
-  'rounded-full bg-gradient-to-b from-[#4AA3FF] to-[#1F6BFF] font-bold text-[#04122E] shadow-[0_10px_30px_rgba(31,107,255,0.5)] transition active:scale-[0.98] disabled:opacity-50';
-const BTN_GOLD =
-  'rounded-full bg-gradient-to-b from-[#FFD25E] to-[#F5B82E] font-bold text-[#2A1B00] shadow-[0_10px_30px_rgba(245,184,46,0.35)] transition active:scale-[0.98] disabled:opacity-50';
-const BTN_GHOST = 'rounded-full border border-white/15 bg-white/5 font-semibold text-white transition active:scale-[0.98] disabled:opacity-40';
-const BTN_GREEN = 'rounded-full bg-emerald-500 font-bold text-white shadow-[0_10px_30px_rgba(16,185,129,0.45)] transition active:scale-[0.98] disabled:opacity-50';
-const INPUT =
-  'w-full rounded-2xl border border-white/10 bg-white/5 px-4 py-3 text-white outline-none transition placeholder:text-white/30 focus:border-[#4AA3FF]';
-const LABEL = 'mb-1 block text-xs font-semibold text-white/60';
-const CHIP_ON = 'border-[#4AA3FF] bg-[#1F6BFF]/25 text-white';
-const CHIP_OFF = 'border-white/10 bg-white/5 text-white/70';
-
-// ─── ICONS ───
-const ICONS: Record<string, string[]> = {
-  home: ['M3 10.5 12 3l9 7.5V21h-6v-6H9v6H3z'],
-  trips: ['M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z', 'M12 7v5l3 2'],
-  wallet: ['M3 7h16a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z', 'M3 7l2-3h12v3', 'M16 13h2'],
-  bell: ['M6 9a6 6 0 0 1 12 0c0 6 2 7 2 7H4s2-1 2-7', 'M10 20a2 2 0 0 0 4 0'],
-  user: ['M12 12a4 4 0 1 0 0-8a4 4 0 0 0 0 8z', 'M4 21a8 8 0 0 1 16 0'],
-  shield: ['M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z', 'M9 12l2 2 4-4'],
-  phone: ['M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2z'],
-  chat: ['M4 5h16v11H8l-4 4z'],
-  navigate: ['M3 11l18-8-8 18-2-8z'],
-  check: ['M5 12l5 5L20 7'],
-  close: ['M6 6l12 12M18 6L6 18'],
-  copy: ['M9 9h11v11H9z', 'M5 15V4h11'],
-  share: ['M12 3v12', 'M7 8l5-5 5 5', 'M5 14v7h14v-7'],
-  plus: ['M12 5v14M5 12h14'],
-  star: ['M12 3l2.7 5.6 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.9 1-6.1L3.2 9.5l6.1-.9z'],
-  locate: ['M12 8a4 4 0 1 0 0 8a4 4 0 0 0 0-8z', 'M12 2v3M12 19v3M2 12h3M19 12h3'],
-  lock: ['M6 11h12v9H6z', 'M8 11V8a4 4 0 0 1 8 0v3'],
-  logout: ['M9 4H5v16h4', 'M16 8l4 4-4 4', 'M20 12H9'],
-  refresh: ['M20 11a8 8 0 1 0-2 6', 'M20 5v6h-6'],
-  chevron: ['M9 6l6 6-6 6'],
-  back: ['M15 6l-6 6 6 6'],
-  power: ['M12 3v9', 'M6.3 6.3a8 8 0 1 0 11.4 0'],
-  gift: ['M20 12v9H4v-9', 'M2 7h20v5H2z', 'M12 7v14', 'M12 7c-2-4-6-3-5 0 .5 1.5 5 0 5 0z', 'M12 7c2-4 6-3 5 0-.5 1.5-5 0-5 0z'],
-  receipt: ['M6 3h12v18l-3-2-3 2-3-2-3 2z', 'M9 8h6M9 12h6'],
-  doc: ['M7 3h8l4 4v14H7z', 'M15 3v4h4'],
-  edit: ['M4 20h4L19 9l-4-4L4 16z', 'M13 7l4 4'],
-};
-
-const Icon = ({ name, className = 'h-5 w-5', fill = false }: { name: string; className?: string; fill?: boolean }) => (
-  <svg
-    viewBox="0 0 24 24"
-    className={className}
-    fill={fill ? 'currentColor' : 'none'}
-    stroke="currentColor"
-    strokeWidth={1.8}
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    {(ICONS[name] || []).map((d, i) => (
-      <path key={i} d={d} />
-    ))}
-  </svg>
+const GoalRing = ({ pct, k }: { pct: number; k: Theme }) => (
+  <div className="relative h-20 w-20 shrink-0">
+    <svg viewBox="0 0 36 36" className="h-20 w-20 -rotate-90" aria-hidden="true">
+      <circle cx="18" cy="18" r="15" fill="none" stroke={k.stroke} strokeOpacity="0.12" strokeWidth="4" />
+      <circle cx="18" cy="18" r="15" fill="none" stroke="#F9D342" strokeWidth="4" strokeLinecap="round" pathLength={100} strokeDasharray={100} strokeDashoffset={100 - pct} className="transition-all duration-700" />
+    </svg>
+    <span className={`absolute inset-0 flex items-center justify-center text-sm font-extrabold ${k.ink}`}>{pct}%</span>
+  </div>
 );
 
-const Spinner = ({ className = 'h-4 w-4' }: { className?: string }) => (
-  <span className={`inline-block ${className} animate-spin rounded-full border-2 border-white/20 border-t-[#4AA3FF]`} role="status" aria-label="Loading" />
-);
-
-const Stars = ({ value, size = 'h-4 w-4' }: { value: number; size?: string }) => (
-  <span className="inline-flex gap-0.5" role="img" aria-label={`${value.toFixed(1)} out of ${MAX_RATING} stars`}>
-    {Array.from({ length: MAX_RATING }, (_, i) => (
-      <Icon key={i} name="star" fill className={`${size} ${i < Math.round(value) ? 'text-[#FFC83D]' : 'text-white/15'}`} />
-    ))}
+const Stars = ({ v, size = 'text-3xl' }: { v: number; size?: string }) => (
+  <span className={`relative inline-block leading-none ${size}`} role="img" aria-label={`${v} out of 5 stars`}>
+    <span className="text-gray-400/40">★★★★★</span>
+    <span className="absolute inset-y-0 left-0 overflow-hidden whitespace-nowrap text-[#F9D342]" style={{ width: `${(v / 5) * 100}%` }}>★★★★★</span>
   </span>
 );
 
-const Switch = ({ on, onChange, label }: { on: boolean; onChange: (v: boolean) => void; label: string }) => (
-  <button
-    role="switch"
-    aria-checked={on}
-    aria-label={label}
-    onClick={() => onChange(!on)}
-    className={`h-7 w-12 shrink-0 rounded-full p-0.5 transition-colors ${on ? 'bg-[#2F80FF]' : 'bg-white/15'}`}
-  >
-    <span className={`block h-6 w-6 rounded-full bg-white shadow transition-transform ${on ? 'translate-x-5' : ''}`} />
+const Donut = ({ parts, k }: { parts: { v: number; c: string; l: string }[]; k: Theme }) => {
+  const total = parts.reduce((s, p) => s + p.v, 0);
+  let acc = 0;
+  return (
+    <svg viewBox="0 0 36 36" className="h-28 w-28 shrink-0 -rotate-90" role="img" aria-label={`Breakdown: ${parts.map(p => `${p.l} ${money(p.v)}`).join(', ')}`}>
+      <circle cx="18" cy="18" r="14" fill="none" stroke={k.stroke} strokeOpacity="0.1" strokeWidth="6" />
+      {total > 0 && parts.map(p => {
+        const len = (p.v / total) * 100;
+        const el = <circle key={p.l} cx="18" cy="18" r="14" fill="none" stroke={p.c} strokeWidth="6" pathLength={100} strokeDasharray={`${len} ${100 - len}`} strokeDashoffset={-acc} />;
+        acc += len;
+        return el;
+      })}
+    </svg>
+  );
+};
+
+const Toggle = ({ on, onChange, label, k }: { on: boolean; onChange: (v: boolean) => void; label: string; k: Theme }) => (
+  <button role="switch" aria-checked={on} aria-label={label} onClick={() => onChange(!on)} className="flex min-h-[44px] min-w-[52px] shrink-0 items-center justify-center">
+    <span className={`flex h-7 w-12 items-center rounded-full p-0.5 transition-colors ${on ? 'bg-emerald-500' : k.soft}`}>
+      <span className={`block h-6 w-6 rounded-full bg-white shadow transition-transform ${on ? 'translate-x-5' : ''}`} />
+    </span>
   </button>
 );
 
-const Sheet = ({
-  title,
-  onClose,
-  children,
-  locked = false,
-}: {
-  title: string;
-  onClose: () => void;
-  children: React.ReactNode;
-  locked?: boolean;
-}) => {
-  // Escape closes the sheet, and the page behind it stops scrolling while it is open
+// Bottom sheet: Escape closes, backdrop closes, page behind stops scrolling, focused inputs scroll above the keyboard
+const Sheet = ({ title, onClose, children, k }: { title: string; onClose: () => void; children: ReactNode; k: Theme }) => {
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !locked) onClose();
-    };
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
     document.addEventListener('keydown', onKey);
     const prev = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
-    return () => {
-      document.removeEventListener('keydown', onKey);
-      document.body.style.overflow = prev;
-    };
-  }, [locked, onClose]);
-
+    return () => { document.removeEventListener('keydown', onKey); document.body.style.overflow = prev; };
+  }, [onClose]);
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-end justify-center bg-black/70 backdrop-blur-sm"
-      role="dialog"
-      aria-modal="true"
-      aria-label={title}
-      onClick={e => {
-        if (e.target === e.currentTarget && !locked) onClose();
-      }}
-    >
-      <div className="max-h-[92dvh] w-full max-w-lg overflow-y-auto rounded-t-[2rem] border-t border-white/10 bg-[#0A1530] p-5 pb-[calc(1.25rem+env(safe-area-inset-bottom))] text-white">
-        <div className="mx-auto mb-4 h-1 w-10 rounded-full bg-white/20" />
-        <div className="mb-4 flex items-center justify-between">
-          <h3 className={`${DISPLAY} text-lg font-bold tracking-tight`}>{title}</h3>
-          <button
-            onClick={onClose}
-            disabled={locked}
-            aria-label="Close"
-            className="flex h-8 w-8 items-center justify-center rounded-full bg-white/10 text-white/70 disabled:opacity-40"
-          >
-            <Icon name="close" className="h-4 w-4" />
-          </button>
+    <div className="fixed inset-0 z-[60] flex items-end justify-center bg-black/60 backdrop-blur-sm" role="dialog" aria-modal="true" aria-label={title}
+      onClick={e => e.target === e.currentTarget && onClose()} onTouchStart={e => e.stopPropagation()} onTouchMove={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
+      <div className={`max-h-[90dvh] w-full max-w-lg overflow-y-auto rounded-t-[2rem] p-5 pb-[calc(1.25rem+env(safe-area-inset-bottom))] ${k.sheet} ${k.ink}`}
+        onFocusCapture={e => { const t = e.target as HTMLElement; if (/INPUT|SELECT|TEXTAREA/.test(t.tagName)) setTimeout(() => t.scrollIntoView({ block: 'center', behavior: 'smooth' }), 300); }}>
+        <div className={`mx-auto mb-3 h-1 w-10 rounded-full ${k.soft}`} />
+        <div className="mb-3 flex items-center justify-between">
+          <h3 className="text-lg font-extrabold">{title}</h3>
+          <button onClick={onClose} aria-label="Close" className={`flex h-11 w-11 items-center justify-center rounded-full ${k.soft} ${PRESS}`}>✕</button>
         </div>
         {children}
       </div>
@@ -545,2408 +249,1087 @@ const Sheet = ({
   );
 };
 
-// ─── NEW-REQUEST POPUP (owns its own countdown so the rest of the dashboard doesn't re-render 4x a second) ───
-const JobAlert = ({
-  booking,
-  expiresAt,
-  walletReady,
-  earn,
-  onDecline,
-  onAccept,
-  onExpire,
-}: {
-  booking: Booking;
-  expiresAt: number;
-  walletReady: boolean;
-  earn: number;
-  onDecline: () => void;
-  onAccept: () => void;
-  onExpire: () => void;
-}) => {
-  const [now, setNow] = useState(Date.now());
-  const expireRef = useRef(onExpire);
-  const firedRef = useRef(false);
-  useEffect(() => {
-    expireRef.current = onExpire;
-  }, [onExpire]);
-  useEffect(() => {
-    firedRef.current = false;
-    const id = setInterval(() => {
-      const t = Date.now();
-      setNow(t);
-      if (t >= expiresAt && !firedRef.current) {
-        firedRef.current = true;
-        expireRef.current();
-      }
-    }, 250);
-    return () => clearInterval(id);
-  }, [expiresAt]);
-
-  const remaining = Math.max(0, Math.ceil((expiresAt - now) / 1000));
-  const svcLabel = SERVICE_META[normalizeService(booking.service_type)].label;
+// Collapsible card used for the long Account tab
+const Fold = ({ title, icon, children, open: initial = false, k }: { title: string; icon: IconName; children: ReactNode; open?: boolean; k: Theme }) => {
+  const [open, setOpen] = useState(initial);
   return (
-    <div className="fixed inset-x-0 top-0 z-[60] px-4 pt-[calc(1rem+env(safe-area-inset-top))]" role="alertdialog" aria-label="New request">
-      <div className="mx-auto max-w-lg rounded-3xl border border-[#4AA3FF]/50 bg-[#0A1530]/95 p-4 shadow-[0_20px_60px_rgba(31,107,255,0.55)] backdrop-blur-xl">
-        <div className="flex items-center gap-3">
-          <div className="relative h-14 w-14 shrink-0">
-            <svg viewBox="0 0 36 36" className="h-14 w-14 -rotate-90" aria-hidden="true">
-              <circle cx="18" cy="18" r="16" fill="none" stroke="rgba(255,255,255,0.12)" strokeWidth="3" />
-              <circle
-                cx="18"
-                cy="18"
-                r="16"
-                fill="none"
-                stroke="#F5B82E"
-                strokeWidth="3"
-                strokeLinecap="round"
-                pathLength={100}
-                strokeDasharray={100}
-                strokeDashoffset={100 - (remaining / ALERT_SECONDS) * 100}
-              />
-            </svg>
-            <span className="absolute inset-0 flex items-center justify-center text-base font-bold">{remaining}</span>
-          </div>
-          <div className="min-w-0 flex-1">
-            <p className="text-xs font-bold tracking-wide text-[#6DB7FF]">NEW {svcLabel.toUpperCase()} REQUEST</p>
-            <p className="truncate text-sm font-bold">
-              {booking.pickup}
-              {booking.destination !== booking.pickup ? ` → ${booking.destination}` : ''}
-            </p>
-            <p className="text-sm font-bold text-[#FFC83D]">
-              GH₵ {money(fareOf(booking))} <span className="text-xs font-semibold text-emerald-400">· earn ~GH₵ {money(earn)}</span>
-            </p>
-          </div>
-        </div>
-        <div className="mt-3 flex gap-3">
-          <button onClick={onDecline} className={`${BTN_GHOST} flex-1 py-3 text-sm`}>
-            Decline
-          </button>
-          <button onClick={onAccept} className={`${walletReady ? BTN_GREEN : BTN_GOLD} flex-[2] py-3 text-sm`}>
-            {walletReady ? 'Accept' : 'Deposit to accept'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-// ─── LIVE MAP (Leaflet + OpenStreetMap, restyled dark with Tailwind arbitrary variants) ───
-type LiveMapProps = {
-  rider?: LatLon | null;
-  pickup?: LatLon | null;
-  destination?: LatLon | null;
-  routeCoords?: [number, number][];
-  height?: number;
-  follow?: boolean;
-};
-
-const MAP_DARK =
-  '[&_.leaflet-tile-pane]:[filter:invert(1)_hue-rotate(195deg)_brightness(0.8)_saturate(0.65)] [&_.leaflet-control-attribution]:!bg-black/40 [&_.leaflet-control-attribution]:!text-[9px] [&_.leaflet-control-attribution]:!text-white/50 [&_.leaflet-control-attribution_a]:!text-white/60';
-
-const LiveMap = ({ rider, pickup, destination, routeCoords, height = 220, follow = false }: LiveMapProps) => {
-  const elRef = useRef<HTMLDivElement>(null);
-  const mapRef = useRef<any>(null);
-  const LRef = useRef<any>(null);
-  const layersRef = useRef<any>({});
-  const ptsRef = useRef<LatLon[]>([]);
-  const [ready, setReady] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const L = (await import('leaflet')).default;
-      if (cancelled || !elRef.current || mapRef.current) return;
-      LRef.current = L;
-      const start = rider || pickup || DEFAULT_CENTER;
-      const map = L.map(elRef.current, { zoomControl: false }).setView([start.lat, start.lon], 15);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap' }).addTo(map);
-      mapRef.current = map;
-      setReady(true);
-      setTimeout(() => map.invalidateSize(), 150);
-    })();
-    return () => {
-      cancelled = true;
-      if (mapRef.current) mapRef.current.remove();
-      mapRef.current = null;
-      layersRef.current = {};
-      setReady(false);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    const L = LRef.current;
-    const map = mapRef.current;
-    if (!ready || !L || !map) return;
-    const layers = layersRef.current;
-    const mk = (html: string, size: number) => L.divIcon({ className: '', html, iconSize: [size, size], iconAnchor: [size / 2, size / 2] });
-    const riderIcon = mk(
-      '<div class="flex h-10 w-10 items-center justify-center rounded-full border-2 border-[#4AA3FF] bg-[#0A1530] text-xl shadow-[0_0_22px_rgba(74,163,255,0.9)]">🛵</div>',
-      40
-    );
-    const pickupIcon = mk('<div class="h-4 w-4 rounded-full border-[3px] border-white bg-[#2F80FF] shadow-[0_0_14px_#2F80FF]"></div>', 16);
-    const destIcon = mk('<div class="h-4 w-4 rounded-[3px] border-[3px] border-white bg-[#FFC83D] shadow-[0_0_14px_#FFC83D]"></div>', 16);
-    const set = (key: string, pos: LatLon | null | undefined, icon: unknown, z: number) => {
-      const cur = layers[key];
-      if (!pos) {
-        if (cur) {
-          cur.remove();
-          layers[key] = undefined;
-        }
-        return;
-      }
-      if (cur) cur.setLatLng([pos.lat, pos.lon]);
-      else layers[key] = L.marker([pos.lat, pos.lon], { icon, zIndexOffset: z, interactive: false }).addTo(map);
-    };
-    set('rider', rider, riderIcon, 500);
-    set('pickup', pickup, pickupIcon, 200);
-    set('dest', destination, destIcon, 200);
-    if (layers.route) {
-      layers.route.remove();
-      layers.route = undefined;
-    }
-    if (routeCoords && routeCoords.length > 1) {
-      layers.route = L.layerGroup([
-        L.polyline(routeCoords, { color: '#2F80FF', weight: 13, opacity: 0.22 }),
-        L.polyline(routeCoords, { color: '#5CB0FF', weight: 5, opacity: 0.95 }),
-      ]).addTo(map);
-    }
-    ptsRef.current = [rider, pickup, destination].filter(Boolean) as LatLon[];
-  }, [ready, rider, pickup, destination, routeCoords]);
-
-  const fit = useCallback((animate = true) => {
-    const map = mapRef.current;
-    const pts = ptsRef.current;
-    if (!map || !pts.length) return;
-    if (pts.length > 1) map.fitBounds(pts.map(p => [p.lat, p.lon]), { padding: [45, 45], animate, maxZoom: 16 });
-    else map.setView([pts[0].lat, pts[0].lon], 15, { animate });
-  }, []);
-
-  useEffect(() => {
-    if (ready) fit(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ready, pickup?.lat, pickup?.lon, destination?.lat, destination?.lon, !!rider]);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (ready && map && follow && rider && !pickup && !destination) map.setView([rider.lat, rider.lon], map.getZoom(), { animate: true });
-  }, [ready, follow, rider?.lat, rider?.lon, pickup, destination]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  return (
-    <div className="relative">
-      <div ref={elRef} style={{ height }} className={`isolate w-full bg-[#0A1530] ${MAP_DARK}`} aria-label="Live map" />
-      <div className="pointer-events-none absolute inset-0 z-[400] bg-gradient-to-t from-[#050B1A]/70 via-transparent to-[#050B1A]/30" />
-      <button
-        onClick={() => fit(true)}
-        aria-label="Recenter map"
-        className="absolute bottom-3 right-3 z-[500] flex h-10 w-10 items-center justify-center rounded-full border border-white/15 bg-[#0A1530]/90 text-[#4AA3FF] shadow-lg"
-      >
-        <Icon name="locate" />
+    <section className={`rounded-3xl ${k.card}`}>
+      <button onClick={() => setOpen(o => !o)} aria-expanded={open} className={`flex ${TAP} w-full items-center gap-3 p-4 text-left ${k.ink}`}>
+        <Icon name={icon} className="h-5 w-5 shrink-0" />
+        <span className="flex-1 font-extrabold">{title}</span>
+        <span className={`transition-transform ${open ? 'rotate-90' : ''} ${k.faint}`} aria-hidden="true">›</span>
       </button>
-    </div>
+      {open && <div className="space-y-3 px-4 pb-4">{children}</div>}
+    </section>
   );
 };
 
-// ─── MAIN COMPONENT ───
-export default function RiderDashboard() {
-  const router = useRouter();
-  const [activeTab, setActiveTab] = useState<TabType>('home');
-  const [profile, setProfile] = useState<RiderProfile>(EMPTY_PROFILE);
-  const [profileState, setProfileState] = useState<ProfileState>('loading');
-  const [isOnline, setIsOnline] = useState(false);
-  const [locationStatus, setLocationStatus] = useState<LocationStatus>('idle');
-  const [currentLocation, setCurrentLocation] = useState<LatLon | null>(null);
-  const [locStale, setLocStale] = useState(false);
-  const [error, setError] = useState('');
-  const [toast, setToast] = useState<{ message: string; type: ToastType } | null>(null);
+// ─── PAGE ───
+export default function RiderDashboardPage() {
+  // navigation + shell
+  const [tab, setTab] = useState<Tab>('home');
+  const [shown, setShown] = useState(true);
+  const [toast, setToast] = useState<{ msg: string; type: 'ok' | 'err' | 'info' } | null>(null);
+  const [loading, setLoading] = useState(true); // skeleton state, true on first load and on every refresh
+  const [refreshing, setRefreshing] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [lastSynced, setLastSynced] = useState(Date.now());
+  const [netOnline, setNetOnline] = useState(true);
+  const [pull, setPull] = useState(0);
+  const [tick, setTick] = useState(0);
+  const [themePref, setThemePref] = useState<ThemePref>('system');
+  const [systemDark, setSystemDark] = useState(false);
+  // work state
+  const [online, setOnline] = useState(false);
+  const [onlineSince, setOnlineSince] = useState<number | null>(null);
+  const [offer, setOffer] = useState<Offer | null>(null);
+  const [job, setJob] = useState<(Offer & { stage: Stage }) | null>(null);
+  const [history, setHistory] = useState<Job[]>(MOCK_HISTORY);
+  const [onBreak, setOnBreak] = useState(false);
+  // jobs tab
+  const [jobsView, setJobsView] = useState<'earnings' | 'performance'>('earnings');
+  const [period, setPeriod] = useState<Period>('today');
+  const [txFilter, setTxFilter] = useState<TxFilter>('all');
+  const [openTx, setOpenTx] = useState<string | null>(null);
+  // home extras
+  const [guideOpen, setGuideOpen] = useState(false);
+  const [goal, setGoal] = useState(MOCK_RIDER.dailyGoal);
+  const [goalOpen, setGoalOpen] = useState(false);
+  const [goalInput, setGoalInput] = useState('');
+  const [weatherOpen, setWeatherOpen] = useState(true);
+  const [checkin, setCheckin] = useState(false);
+  // sheets + notifications
+  const [notes, setNotes] = useState<Note[]>(MOCK_NOTES);
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [quiet, setQuiet] = useState(false);
+  const [safetyOpen, setSafetyOpen] = useState(false);
+  const [tipsOpen, setTipsOpen] = useState(false);
+  const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
+  const [badgeSel, setBadgeSel] = useState<string | null>(null);
+  // account
+  const [rider, setRider] = useState(MOCK_RIDER);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({ name: MOCK_RIDER.name, phone: MOCK_RIDER.phone, email: MOCK_RIDER.email });
+  const [saving, setSaving] = useState(false);
+  const [vehicles, setVehicles] = useState<Vehicle[]>(MOCK_VEHICLES);
+  const [addVeh, setAddVeh] = useState(false);
+  const [vehForm, setVehForm] = useState({ model: '', plate: '', color: '' });
+  const [sched, setSched] = useState<Sched[]>(DEFAULT_SCHED);
+  const [helpQ, setHelpQ] = useState('');
+  const [helpCat, setHelpCat] = useState<string | null>(null);
+  const [helpOpen, setHelpOpen] = useState<string | null>(null);
+  const [sessions, setSessions] = useState(MOCK_SESSIONS);
+  const [pwOpen, setPwOpen] = useState(false);
+  const [pw, setPw] = useState({ cur: '', next: '', again: '' });
+  const [twoFA, setTwoFA] = useState(false);
+  const [twoFAOpen, setTwoFAOpen] = useState(false);
+  const [code, setCode] = useState('');
+  const [logoutAll, setLogoutAll] = useState(false);
+  // wallet, service, chat, photo, proof of delivery
+  const [walletBal, setWalletBal] = useState(MOCK_RIDER.walletBalance);
+  const [dest, setDest] = useState<Dest>(null); // BACKEND: saved deposit method, locked once set
+  const [svc, setSvc] = useState('ride'); // BACKEND: PATCH /rider-services/active/
+  const [msgs, setMsgs] = useState<Msg[]>([]);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [photoOpen, setPhotoOpen] = useState(false);
+  const [photoUrl, setPhotoUrl] = useState<string | undefined>(undefined);
+  const [photoStatus, setPhotoStatus] = useState<'verified' | 'pending' | 'none'>('none');
+  const [proofOpen, setProofOpen] = useState(false);
+  const [showDone, setShowDone] = useState(false); // map: show completed jobs
+  const [walletOpen, setWalletOpen] = useState(false); // dedicated wallet page
+  const [walletView, setWalletView] = useState<'deposit' | 'withdraw'>('deposit');
+  const [txns, setTxns] = useState<Txn[]>([]); // BACKEND: GET /wallet/transactions/
 
-  // Jobs
-  const [availableJobs, setAvailableJobs] = useState<Booking[]>([]);
-  const [activeJob, setActiveJob] = useState<Booking | null>(null);
-  const [history, setHistory] = useState<Booking[]>([]);
-  const [alertJob, setAlertJob] = useState<{ booking: Booking; expiresAt: number } | null>(null);
-  const [busyId, setBusyId] = useState<string | null>(null);
-  const [jobGeo, setJobGeo] = useState<{ id: string; pickup: LatLon | null; dest: LatLon | null } | null>(null);
-  const [tripRoute, setTripRoute] = useState<{ km: number; min: number; coords: [number, number][] } | null>(null);
-  const [routeTick, setRouteTick] = useState(0);
-  const [confirmComplete, setConfirmComplete] = useState(false);
-  const [summary, setSummary] = useState<Summary | null>(null);
-
-  // Wallet
-  const [wallet, setWallet] = useState<WalletData>({ balance: 0, total_earned: 0, total_withdrawn: 0, commission_rate: DEFAULT_COMMISSION_LABEL });
-  const [walletLoaded, setWalletLoaded] = useState(false);
-  const [walletFailed, setWalletFailed] = useState(false);
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [txFilter, setTxFilter] = useState<'all' | 'today' | 'week'>('all');
-  const [showDeposit, setShowDeposit] = useState(false);
-  const [showWithdraw, setShowWithdraw] = useState(false);
-  const [sheetError, setSheetError] = useState('');
-  const [sheetBusy, setSheetBusy] = useState(false);
-  const [amountInput, setAmountInput] = useState('');
-  const [phoneInput, setPhoneInput] = useState('');
-  const [networkInput, setNetworkInput] = useState<Network>('');
-  const [depositMethod, setDepositMethod] = useState<DepositMethod>('mobile_money');
-  const [depositWaitingUntil, setDepositWaitingUntil] = useState(0);
-  const depositStartBalance = useRef(0);
-
-  // Trips filters
-  const [tripPeriod, setTripPeriod] = useState<Period>('all');
-  const [tripService, setTripService] = useState<'all' | ServiceKey>('all');
-  const [tripQuery, setTripQuery] = useState('');
-
-  // Notifications, prefs, misc UI
-  const [notes, setNotes] = useState<Note[]>(NO_NOTES);
-  const [prefs, setPrefs] = useState<Prefs>({ sound: true, vibration: true, jobAlerts: true });
-  const [language, setLanguage] = useState('English');
-  const [dailyGoal, setDailyGoal] = useState(DEFAULT_DAILY_GOAL);
-  const [requestedServices, setRequestedServices] = useState<ServiceKey[]>([]);
-  const [referralStats, setReferralStats] = useState({ total: 0, pending: 0, earned: 0 });
-  const [inviteAudience, setInviteAudience] = useState<'riders' | 'customers'>('riders');
-  const [showGoal, setShowGoal] = useState(false);
-  const [showSafety, setShowSafety] = useState(false);
-  const [showInvite, setShowInvite] = useState(false);
-  const [showEdit, setShowEdit] = useState(false);
-  const [showLogout, setShowLogout] = useState(false);
-  const [showLocPrompt, setShowLocPrompt] = useState(false);
-  const [pendingOnline, setPendingOnline] = useState(false);
-  const [editForm, setEditForm] = useState({ name: '', phone: '', email: '' });
-
-  // Refs holding latest values for timers/watchers
-  const profileRef = useRef(profile);
-  const onlineRef = useRef(isOnline);
-  const activeJobRef = useRef<Booking | null>(null);
-  const locRef = useRef<LatLon | null>(null);
-  const prefsRef = useRef(prefs);
-  const activeKeysRef = useRef<ServiceKey[]>(ALL_SERVICE_KEYS);
-  const declinedRef = useRef<Set<string>>(new Set());
-  const seenRef = useRef<Set<string>>(new Set());
-  const firstLoadRef = useRef(true);
-  const resumedRef = useRef(false);
-  const lastSentRef = useRef(0);
-  const lastFixRef = useRef(0);
+  const touchY = useRef<number | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    profileRef.current = profile;
-  }, [profile]);
-  useEffect(() => {
-    onlineRef.current = isOnline;
-  }, [isOnline]);
-  useEffect(() => {
-    activeJobRef.current = activeJob;
-  }, [activeJob]);
-  useEffect(() => {
-    locRef.current = currentLocation;
-  }, [currentLocation]);
-  useEffect(() => {
-    prefsRef.current = prefs;
-  }, [prefs]);
+  const dark = themePref === 'dark' || (themePref === 'system' && systemDark);
+  const K: Theme = dark ? DARK : LIGHT;
 
-  // Load local preferences once
-  useEffect(() => {
-    setNotes(readJSON<Note[]>('rydn_notes', []));
-    setPrefs(readJSON<Prefs>('rydn_prefs', { sound: true, vibration: true, jobAlerts: true }));
-    setLanguage(readJSON<string>('rydn_lang', 'English'));
-    setDailyGoal(readJSON<number>('rydn_daily_goal', DEFAULT_DAILY_GOAL));
+  const notify = useCallback((msg: string, type: 'ok' | 'err' | 'info' = 'info') => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast({ msg, type });
+    toastTimer.current = setTimeout(() => setToast(null), 3000);
   }, []);
-  useEffect(() => {
-    if (notes !== NO_NOTES) writeJSON('rydn_notes', notes);
-  }, [notes]);
 
-  const persistOnline = (online: boolean) => writeJSON('rydn_rider', { ...readJSON<Record<string, unknown>>('rydn_rider', {}), online });
+  // Add an in-app notification. BACKEND: these come from your push/websocket feed.
+  const pushNote = useCallback((group: NoteGroup, icon: string, title: string, msg: string, action?: string) => {
+    setNotes(p => [{ id: `n${Date.now()}${Math.round(Math.random() * 999)}`, group, icon, title, msg, at: Date.now(), read: false, action }, ...p]);
+  }, []);
+
+  // Pretend-save indicator. BACKEND: call this after each successful PATCH/POST instead.
+  const touchSync = useCallback(() => {
+    setSyncing(true);
+    setTimeout(() => { setSyncing(false); setLastSynced(Date.now()); }, 700);
+  }, []);
+
+  // ─── EFFECTS ───
+  useEffect(() => {
+    const t = store.get('rydn_dash_tab') as Tab | null;
+    if (t && ['home', 'jobs', 'account'].includes(t)) setTab(t);
+    setGuideOpen(store.get('rydn_guide_seen') !== todayKey());
+    const th = store.get('rydn_theme') as ThemePref | null;
+    if (th && ['light', 'dark', 'system'].includes(th)) setThemePref(th);
+    const g = Number(store.get('rydn_goal')); if (g > 0) setGoal(g);
+    setQuiet(store.get('rydn_quiet') === '1');
+    setOnBreak(store.get('rydn_break') === '1');
+    try { const s = JSON.parse(store.get('rydn_sched') || 'null'); if (Array.isArray(s) && s.length === 7) setSched(s); } catch { /* ignore */ }
+    setNetOnline(navigator.onLine);
+    const timer = setTimeout(() => setLoading(false), 900); // BACKEND: replace with real initial fetches
+    return () => clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    setSystemDark(mq.matches);
+    const on = (e: MediaQueryListEvent) => setSystemDark(e.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+
+  useEffect(() => {
+    const up = () => { setNetOnline(true); touchSync(); notify('Back online.', 'ok'); };
+    const down = () => setNetOnline(false);
+    window.addEventListener('online', up);
+    window.addEventListener('offline', down);
+    return () => { window.removeEventListener('online', up); window.removeEventListener('offline', down); };
+  }, [notify, touchSync]);
+
+  useEffect(() => { const id = setInterval(() => setTick(t => t + 1), 30_000); return () => clearInterval(id); }, []);
+
+  // Safety check-in while a trip is in progress
+  useEffect(() => {
+    if (job?.stage !== 'trip') { setCheckin(false); return; }
+    const id = setInterval(() => setCheckin(true), CHECKIN_MS);
+    return () => clearInterval(id);
+  }, [job?.stage]);
+
+  // Grab a position snapshot when the safety centre opens (used for the emergency / share links)
+  useEffect(() => {
+    if (!safetyOpen || !navigator.geolocation) return;
+    navigator.geolocation.getCurrentPosition(p => setCoords({ lat: p.coords.latitude, lon: p.coords.longitude }), () => setCoords(null), { timeout: 8000 });
+  }, [safetyOpen]);
+
+  useEffect(() => {
+    if (!walletOpen) return;
+    const on = (e: KeyboardEvent) => e.key === 'Escape' && setWalletOpen(false);
+    document.addEventListener('keydown', on);
+    const prev = document.body.style.overflow; document.body.style.overflow = 'hidden';
+    return () => { document.removeEventListener('keydown', on); document.body.style.overflow = prev; };
+  }, [walletOpen]);
 
   // ─── DERIVED ───
-  const statusKey = (profile.status || '').toLowerCase();
-  const restricted = !!statusKey && RESTRICTED_STATUSES.includes(statusKey);
-  const unverified = !!statusKey && UNVERIFIED_STATUSES.includes(statusKey);
-  const blocked = restricted || unverified; // blocked riders can't go online or accept jobs
-  const walletReady = wallet.balance >= MIN_WALLET_BALANCE;
-  const shortfall = Math.max(MIN_WALLET_BALANCE - wallet.balance, 0);
-  const withdrawable = Math.max(wallet.balance - MIN_WALLET_BALANCE, 0);
-  const commissionRate = useMemo(() => {
-    const n = parseFloat(wallet.commission_rate);
-    if (!Number.isFinite(n) || n <= 0) return DEFAULT_COMMISSION;
-    return n <= 1 ? n : n / 100; // accepts "0.15" and "15%"
-  }, [wallet.commission_rate]);
-  const earnOf = useCallback((j: Booking) => fareOf(j) * (1 - commissionRate), [commissionRate]);
-
-  const services: RiderService[] = useMemo(
-    () => (profile.services.length ? profile.services : ALL_SERVICE_KEYS.map(k => ({ key: k, approved: true, active: true }))),
-    [profile.services]
-  );
-  const approvedServices = useMemo(() => services.filter(s => s.approved), [services]);
-  const activeKeys = useMemo(() => services.filter(s => s.approved && s.active).map(s => s.key), [services]);
-  useEffect(() => {
-    activeKeysRef.current = activeKeys;
-  }, [activeKeys]);
-
-  const periodStats = useMemo(() => {
-    const calc = (p: Period) => {
-      const from = periodStart(p);
-      const jobs = transactions.filter(tx => tx.type === 'job_payment' && new Date(tx.created_at).getTime() >= from);
-      return { earned: jobs.reduce((s, tx) => s + txAmount(tx), 0), trips: jobs.length, fees: jobs.reduce((s, tx) => s + Number(tx.commission || 0), 0) };
-    };
-    return { today: calc('today'), week: calc('week'), month: calc('month'), all: calc('all') };
-  }, [transactions]);
-  const todayStats = periodStats.today;
-  const goalPct = Math.min(100, Math.round((todayStats.earned / Math.max(dailyGoal, 1)) * 100));
-
+  void tick;
+  const docState: DocStatus = MOCK_DOCS.some(d => d.status === 'action') ? 'action' : MOCK_DOCS.some(d => d.status === 'pending') ? 'pending' : 'verified';
+  const todayJobs = useMemo(() => history.filter(j => j.at >= startOfDay()), [history]);
+  const todayEarned = todayJobs.reduce((s, j) => s + netOf(j), 0);
+  const goalPct = Math.min(100, Math.round((todayEarned / Math.max(goal, 1)) * 100));
+  const weekJobs = useMemo(() => history.filter(j => j.at >= periodStart('week')), [history]);
+  const weekNet = weekJobs.reduce((s, j) => s + netOf(j), 0);
+  const allTimeNet = useMemo(() => history.reduce((s, j) => s + netOf(j), 0), [history]);
+  const periodJobs = useMemo(() => history.filter(j => j.at >= periodStart(period)), [history, period]);
+  const totals = useMemo(() => {
+    const t = { base: 0, fee: 0, bonus: 0, net: 0, cashNet: 0, onlineNet: 0 };
+    for (const j of periodJobs) {
+      const n = netOf(j);
+      t.base += j.base; t.fee += j.fee; t.bonus += j.bonus; t.net += n;
+      if (j.method === 'cash') t.cashNet += n; else t.onlineNet += n;
+    }
+    return t;
+  }, [periodJobs]);
+  const weekBars = useMemo(() => Array.from({ length: 7 }, (_, i) => {
+    const d = startOfDay() - (6 - i) * 24 * HOUR;
+    return { label: new Date(d).toLocaleDateString('en-GB', { weekday: 'narrow' }), v: history.filter(j => j.at >= d && j.at < d + 24 * HOUR).reduce((s, j) => s + netOf(j), 0) };
+  }), [history]);
+  const maxBar = Math.max(...weekBars.map(b => b.v), 1);
+  const listJobs = useMemo(() => periodJobs.filter(j => (txFilter === 'cash' ? j.method === 'cash' : txFilter === 'online' ? j.method === 'online' : txFilter === 'bonus' ? j.bonus > 0 : txFilter === 'fee' ? j.fee > 0 : true)), [periodJobs, txFilter]);
   const unread = notes.filter(n => !n.read).length;
-  const myReferralCode = profile.referral_code || makeReferralCode(`rider-${profile.rider_id ?? profile.email ?? 'guest'}`);
-
-  // ─── TOAST + NOTIFICATIONS ───
-  const notify = useCallback((message: string, type: ToastType = 'info', duration = 3500) => {
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    setToast({ message, type });
-    toastTimer.current = setTimeout(() => setToast(null), duration);
-  }, []);
-  useEffect(
-    () => () => {
-      if (toastTimer.current) clearTimeout(toastTimer.current);
-    },
-    []
-  );
-
-  const pushNote = useCallback((kind: NoteKind, title: string, body: string, tab?: TabType) => {
-    const n: Note = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, kind, title, body, created_at: new Date().toISOString(), read: false, tab };
-    setNotes(prev => [n, ...prev].slice(0, 50));
-  }, []);
-
-  // ─── API WRAPPER (auto-logout on 401) ───
-  const handleUnauth = useCallback(() => {
-    clearSession();
-    setIsOnline(false);
-    setProfileState('unauth');
-  }, []);
-  const call = useCallback(
-    async (path: string, init: RequestInit = {}) => {
-      const res = await api(path, init);
-      if (res.status === 401) handleUnauth();
-      return res;
-    },
-    [handleUnauth]
-  );
-
-  useEffect(() => {
-    if (profileState === 'unauth') router.replace(LOGIN_PATH);
-  }, [profileState, router]);
-
-  // ─── PROFILE ───
-  const loadProfile = useCallback(async () => {
-    const cached = readJSON<Partial<RiderProfile> & { online?: boolean }>('rydn_rider', {});
-    if (!getToken()) {
-      setProfileState('unauth');
-      return;
-    }
-    try {
-      const res = await call(PROFILE_PATH);
-      if (res.ok) {
-        const mapped = mapRiderProfile(await res.json(), cached);
-        if (!mapped.rider_id) {
-          setProfileState('unlinked');
-          return;
-        }
-        setProfile(mapped);
-        writeJSON('rydn_rider', { ...mapped, online: cached.online });
-        setProfileState('ready');
-        return;
-      }
-      if (res.status === 401 || res.status === 403) {
-        setProfileState('unauth');
-        return;
-      }
-    } catch {
-      /* offline: fall back to the cached profile */
-    }
-    if (cached.rider_id) {
-      setProfile({ ...EMPTY_PROFILE, ...cached, services: cached.services || [] });
-      setProfileState('ready');
-    } else setProfileState('unlinked');
-  }, [call]);
-
-  useEffect(() => {
-    loadProfile();
-  }, [loadProfile]);
-
-  // Re-check profile (approval, restrictions) whenever the app returns to the foreground
-  useEffect(() => {
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') loadProfile();
-    };
-    document.addEventListener('visibilitychange', onVisible);
-    return () => document.removeEventListener('visibilitychange', onVisible);
-  }, [loadProfile]);
-
-  const patchProfile = useCallback(
-    async (body: Record<string, unknown>) => {
-      try {
-        return await call(PROFILE_PATH, { method: 'PATCH', body: JSON.stringify(body) });
-      } catch {
-        return null;
-      }
-    },
-    [call]
-  );
-
-  // ─── LOCATION ───
-  const requestLocation = useCallback(() => {
-    if (typeof navigator === 'undefined' || !navigator.geolocation) {
-      setLocationStatus('error');
-      setError('This device does not support location services.');
-      return;
-    }
-    setLocationStatus('requesting');
-    navigator.geolocation.getCurrentPosition(
-      pos => {
-        lastFixRef.current = Date.now();
-        setCurrentLocation({ lat: pos.coords.latitude, lon: pos.coords.longitude });
-        setLocationStatus('granted');
-        setError('');
-      },
-      err => {
-        setLocationStatus(err.code === 1 ? 'denied' : 'error');
-        setError(err.code === 1 ? 'Location is blocked. Allow it in your phone or browser settings to receive jobs.' : 'We couldn’t get your location. Check GPS and try again.');
-      },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-    );
-  }, []);
-
-  useEffect(() => {
-    if (typeof navigator === 'undefined' || !navigator.permissions?.query) return;
-    navigator.permissions
-      .query({ name: 'geolocation' as PermissionName })
-      .then(s => {
-        if (s.state === 'granted') requestLocation();
-      })
-      .catch(() => {});
-  }, [requestLocation]);
-
-  const sendLocation = useCallback(
-    async (loc: LatLon) => {
-      const id = profileRef.current.rider_id;
-      if (!id) return;
-      try {
-        await call('/update-rider-location/', {
-          method: 'POST',
-          body: JSON.stringify({ rider_id: id, latitude: loc.lat, longitude: loc.lon, is_online: onlineRef.current, booking_id: activeJobRef.current?.id ?? null }),
-        });
-      } catch {
-        /* best effort */
-      }
-    },
-    [call]
-  );
-
-  // Live GPS: every ~20 s while online, every ~7 s during a trip
-  useEffect(() => {
-    if (locationStatus !== 'granted' || typeof navigator === 'undefined' || !navigator.geolocation) return;
-    if (!isOnline && !activeJob) return;
-    const id = navigator.geolocation.watchPosition(
-      pos => {
-        const loc = { lat: pos.coords.latitude, lon: pos.coords.longitude };
-        const t = Date.now();
-        lastFixRef.current = t;
-        setLocStale(false);
-        setCurrentLocation(loc);
-        const gap = activeJobRef.current ? GPS_TRIP_MS : GPS_IDLE_MS;
-        if (t - lastSentRef.current >= gap) {
-          lastSentRef.current = t;
-          sendLocation(loc);
-        }
-      },
-      err => {
-        if (err.code === 1) setLocationStatus('denied');
-      },
-      { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 }
-    );
-    return () => navigator.geolocation.clearWatch(id);
-  }, [locationStatus, isOnline, !!activeJob, sendLocation]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Warn when location updates stop
-  useEffect(() => {
-    if (!isOnline && !activeJob) {
-      setLocStale(false);
-      return;
-    }
-    lastFixRef.current = lastFixRef.current || Date.now();
-    const id = setInterval(() => setLocStale(Date.now() - lastFixRef.current > LOCATION_STALE_MS), 10000);
-    return () => clearInterval(id);
-  }, [isOnline, !!activeJob]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ─── WALLET / DATA ───
-  const fetchWallet = useCallback(async () => {
-    const id = profileRef.current.rider_id;
-    if (!id) return;
-    try {
-      const res = await call(`/get-rider-wallet/?rider_id=${id}`);
-      if (res.ok) {
-        setWallet(normalizeWallet(await res.json()));
-        setWalletLoaded(true);
-        setWalletFailed(false);
-      } else setWalletFailed(true);
-    } catch {
-      setWalletFailed(true); // keep the last known balance on screen
-    }
-  }, [call]);
-
-  const fetchTransactions = useCallback(async () => {
-    const id = profileRef.current.rider_id;
-    if (!id) return;
-    try {
-      const res = await call(`/rider-transactions/?rider_id=${id}`);
-      if (res.ok) {
-        const data = await res.json();
-        setTransactions(data.transactions || data.results || []);
-      }
-    } catch {
-      /* keep last known */
-    }
-  }, [call]);
-
-  const fetchReferrals = useCallback(async () => {
-    const id = profileRef.current.rider_id;
-    if (!id) return;
-    try {
-      const res = await call(`/rider-referrals/?rider_id=${id}`);
-      if (res.ok) {
-        const d = await res.json();
-        setReferralStats({ total: Number(d.total || 0), pending: Number(d.pending || 0), earned: Number(d.earned || 0) });
-      }
-    } catch {
-      /* endpoint optional */
-    }
-  }, [call]);
-
-  const fetchNotifications = useCallback(async () => {
-    try {
-      const res = await call('/rider-notifications/');
-      if (!res.ok) return;
-      const data = await res.json();
-      const incoming: Note[] = (data.notifications || data.results || []).map((n: any) => ({
-        id: `srv-${n.id}`,
-        kind: (['job', 'cancelled', 'payment', 'account', 'system'].includes(n.type) ? n.type : 'system') as NoteKind,
-        title: n.title || 'Rydnow',
-        body: n.message || n.body || '',
-        created_at: n.created_at || new Date().toISOString(),
-        read: !!(n.is_read ?? n.read),
-        tab: n.type === 'payment' ? 'wallet' : n.type === 'account' ? 'profile' : undefined,
-      }));
-      if (!incoming.length) return;
-      setNotes(prev => {
-        const known = new Set(prev.map(p => p.id));
-        const fresh = incoming.filter(n => !known.has(n.id));
-        return fresh.length ? [...fresh, ...prev].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 50) : prev;
-      });
-    } catch {
-      /* endpoint optional */
-    }
-  }, [call]);
-
-  useEffect(() => {
-    if (profileState !== 'ready') return;
-    fetchWallet();
-    fetchTransactions();
-    fetchReferrals();
-    fetchNotifications();
-  }, [profileState, fetchWallet, fetchTransactions, fetchReferrals, fetchNotifications]);
-
-  useEffect(() => {
-    if (activeTab === 'wallet' || activeTab === 'home') {
-      fetchWallet();
-      fetchTransactions();
-    }
-    if (activeTab === 'alerts') fetchNotifications();
-  }, [activeTab, fetchWallet, fetchTransactions, fetchNotifications]);
-
-  useEffect(() => {
-    if (!isOnline) return;
-    const id = setInterval(fetchWallet, 30000);
-    return () => clearInterval(id);
-  }, [isOnline, fetchWallet]);
-
-  // After a deposit request, poll until the balance rises (rider approves the MoMo prompt)
-  useEffect(() => {
-    if (!depositWaitingUntil) return;
-    const id = setInterval(() => {
-      if (Date.now() > depositWaitingUntil) setDepositWaitingUntil(0);
-      else fetchWallet();
-    }, 4000);
-    return () => clearInterval(id);
-  }, [depositWaitingUntil, fetchWallet]);
-
-  useEffect(() => {
-    if (depositWaitingUntil && wallet.balance > depositStartBalance.current) {
-      setDepositWaitingUntil(0);
-      notify(`Deposit received. Wallet: GH₵ ${money(wallet.balance)}`, 'success', 5000);
-      pushNote('payment', 'Deposit received', `Your wallet now holds GH₵ ${money(wallet.balance)}.`, 'wallet');
-      fetchTransactions();
-    }
-  }, [wallet.balance, depositWaitingUntil, notify, pushNote, fetchTransactions]);
-
-  // Returning from the hosted card payment page (?reference=… / ?trxref=…): confirm the deposit
-  const cardReturnRef = useRef(false);
-  useEffect(() => {
-    if (profileState !== 'ready' || cardReturnRef.current) return;
-    const q = new URLSearchParams(window.location.search);
-    if (!q.get('reference') && !q.get('trxref')) return;
-    cardReturnRef.current = true;
-    let start = 0;
-    try {
-      start = Number(sessionStorage.getItem('rydn_dep_start')) || 0;
-      sessionStorage.removeItem('rydn_dep_start');
-    } catch {
-      /* ignore */
-    }
-    depositStartBalance.current = start;
-    setDepositWaitingUntil(Date.now() + 120000);
-    setActiveTab('wallet');
-    notify('Confirming your card payment…', 'info', 4000);
-    window.history.replaceState({}, '', window.location.pathname);
-  }, [profileState, notify]);
-
-  // Resume the "online" choice after a reload, but only once we know the rider is still allowed to work
-  useEffect(() => {
-    if (resumedRef.current || profileState !== 'ready' || locationStatus !== 'granted' || !walletLoaded) return;
-    resumedRef.current = true;
-    if (!readJSON<{ online?: boolean }>('rydn_rider', {}).online) return;
-    if (blocked || !walletReady || activeKeys.length === 0) {
-      persistOnline(false);
-      return;
-    }
-    firstLoadRef.current = true;
-    onlineRef.current = true;
-    setIsOnline(true);
-  }, [profileState, locationStatus, walletLoaded, blocked, walletReady, activeKeys.length]);
-
-  // ─── JOBS ───
-  const fetchBookings = useCallback(async () => {
-    const p = profileRef.current;
-    if (!p.rider_id) return;
-    try {
-      const res = await call('/list-bookings/');
-      if (!res.ok) return;
-      const data = await res.json();
-      const list: Booking[] = data.bookings || data.results || (Array.isArray(data) ? data : []);
-
-      const mine = list.find(j => riderOf(j) === p.rider_id && ['assigned', 'arrived', 'in_progress'].includes(j.status));
-      const prev = activeJobRef.current;
-      if (prev && !mine) {
-        const upd = list.find(j => String(j.id) === String(prev.id));
-        if (upd?.status === 'cancelled') {
-          pushNote('cancelled', 'Trip cancelled', `The customer cancelled the trip from ${prev.pickup}.`, 'home');
-          notify('The customer cancelled this trip.', 'error', 5000);
-        }
-      }
-      setActiveJob(mine || null);
-      setHistory(
-        list
-          .filter(j => riderOf(j) === p.rider_id && ['completed', 'cancelled'].includes(j.status))
-          .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime())
-      );
-
-      if (!onlineRef.current || mine) {
-        setAvailableJobs([]);
-        return;
-      }
-
-      const loc = locRef.current;
-      const eligible = list
-        .filter(j => j.status === 'searching_rider')
-        .filter(j => activeKeysRef.current.includes(normalizeService(j.service_type)))
-        .filter(j => !declinedRef.current.has(String(j.id)))
-        .filter(j => {
-          const pu = toLatLon(j.pickup_lat, j.pickup_lng);
-          return !loc || !pu || distanceKm(loc, pu) <= MAX_PICKUP_KM;
-        })
-        .sort((a, b) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
-
-      const fresh = eligible.filter(j => !seenRef.current.has(String(j.id)));
-      eligible.forEach(j => seenRef.current.add(String(j.id)));
-      if (!firstLoadRef.current && fresh.length) {
-        const j = fresh[0];
-        pushNote('job', 'New request', `${SERVICE_META[normalizeService(j.service_type)].label} · ${j.pickup} · GH₵ ${money(fareOf(j))}`, 'home');
-        if (prefsRef.current.jobAlerts) {
-          setAlertJob({ booking: j, expiresAt: Date.now() + ALERT_SECONDS * 1000 });
-          alertRider(prefsRef.current);
-        }
-      }
-      firstLoadRef.current = false;
-      setAvailableJobs(eligible);
-      // Drop the popup if the request was taken or cancelled in the meantime
-      setAlertJob(a => (a && eligible.some(j => String(j.id) === String(a.booking.id)) ? a : null));
-    } catch {
-      /* retry on the next tick */
-    }
-  }, [call, notify, pushNote]);
-
-  useEffect(() => {
-    if (profileState !== 'ready') return;
-    fetchBookings(); // also resumes a trip in progress after a reload
-    if (!isOnline && !activeJob) return;
-    const id = setInterval(fetchBookings, 5000);
-    return () => clearInterval(id);
-  }, [profileState, isOnline, !!activeJob, fetchBookings]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const declineJob = useCallback(
-    (id: string | number, auto = false) => {
-      declinedRef.current.add(String(id));
-      setAvailableJobs(prev => prev.filter(j => String(j.id) !== String(id)));
-      setAlertJob(a => (a && String(a.booking.id) === String(id) ? null : a));
-      call('/decline-booking/', {
-        method: 'POST',
-        body: JSON.stringify({ booking_id: id, rider_id: profileRef.current.rider_id, reason: auto ? 'timeout' : 'declined' }),
-      }).catch(() => {});
-    },
-    [call]
-  );
-
-  // Coordinates for the active trip (booking coordinates, otherwise geocode the addresses once)
-  useEffect(() => {
-    if (!activeJob) {
-      setJobGeo(null);
-      setTripRoute(null);
-      return;
-    }
-    const id = String(activeJob.id);
-    let cancelled = false;
-    const p = toLatLon(activeJob.pickup_lat, activeJob.pickup_lng);
-    const d = toLatLon(activeJob.destination_lat, activeJob.destination_lng);
-    if (p) {
-      setJobGeo({ id, pickup: p, dest: d || p });
-      return;
-    }
-    (async () => {
-      const pr = await geocode(activeJob.pickup);
-      const dr = activeJob.destination === activeJob.pickup ? pr : await geocode(activeJob.destination);
-      if (!cancelled) setJobGeo({ id, pickup: pr, dest: dr || pr });
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [activeJob?.id]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Refresh the ETA every 30 s during a trip
-  useEffect(() => {
-    if (!activeJob) return;
-    const id = setInterval(() => setRouteTick(t => t + 1), 30000);
-    return () => clearInterval(id);
-  }, [!!activeJob]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    if (!activeJob || !jobGeo) return;
-    const inProgress = activeJob.status === 'in_progress';
-    const from = inProgress ? jobGeo.pickup : locRef.current || jobGeo.pickup;
-    const to = inProgress ? jobGeo.dest : jobGeo.pickup;
-    if (!from || !to) return;
-    let cancelled = false;
-    getRoute(from, to).then(r => {
-      if (!cancelled) setTripRoute(r);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [jobGeo, activeJob?.status, !!currentLocation, routeTick]); // eslint-disable-line react-hooks/exhaustive-deps
+  const shiftMs = online && onlineSince ? Date.now() - onlineSince : 0;
+  const hour = new Date().getHours();
+  const inPeak = hour >= PEAK.from && hour < PEAK.to;
+  const minsToPeak = hour < PEAK.from ? (PEAK.from - hour) * 60 - new Date().getMinutes() : 0;
+  const msLeft = Math.max(0, weekEnd() - Date.now());
+  const leftTxt = `${Math.floor(msLeft / 86400000)}d ${Math.floor((msLeft % 86400000) / HOUR)}h left`;
+  const milestones = [
+    { id: 'm1', title: 'Complete 10 trips', reward: 15, cur: weekJobs.length, target: 10, fmt: (n: number) => String(n) },
+    { id: 'm2', title: 'Earn GH₵ 300 this week', reward: 25, cur: weekNet, target: 300, fmt: (n: number) => `GH₵ ${Math.round(n)}` },
+  ];
+  const nextBadge = BADGES.filter(b => !b.at).sort((a, b) => b.cur / b.target - a.cur / a.target)[0];
+  const tomorrowIdx = (((new Date().getDay() + 6) % 7) + 1) % 7;
+  const etaMin = job ? Math.max(3, Math.round(job.km * 3)) : 0;
+  const tripMsg = `I’m on a Rydnow ${job ? `trip: ${job.from} to ${job.to}, ETA about ${etaMin} min.` : 'job.'}${coords ? ` My location: https://www.google.com/maps?q=${coords.lat},${coords.lon}` : ''}`;
+  const customerInfo = job ? { name: job.customer, address: job.to, phone: MOCK_CUSTOMER.phone, rating: MOCK_CUSTOMER.rating, trips: MOCK_CUSTOMER.trips } : null; // BACKEND: real customer profile + verified photo
+  const svcName = DEFAULT_SERVICES.find(s => s.id === svc)?.name ?? '';
+  const txList = [...txns, ...history.slice(0, 8).map(j => ({ id: j.id, kind: 'earning' as const, label: `${j.from} → ${j.to}`, amount: netOf(j), at: j.at }))].sort((a, b) => b.at - a.at).slice(0, 12);
+  const initials = rider.name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase();
 
   // ─── ACTIONS ───
-  const blockers = useMemo(() => {
-    const b: string[] = [];
-    if (restricted) b.push('Your account has been restricted by Rydnow. Contact support to get back online.');
-    else if (unverified) b.push('Your account is still being verified. We’ll notify you as soon as you’re approved.');
-    if (!walletLoaded) b.push(walletFailed ? 'We couldn’t check your wallet. Tap Retry on the home screen.' : 'Checking your wallet… try again in a moment.');
-    else if (!walletReady) b.push(`Deposit GH₵ ${money(shortfall)} to unlock jobs.`);
-    if (activeKeys.length === 0) b.push('Switch on at least one service you want to work on.');
-    return b;
-  }, [restricted, unverified, walletLoaded, walletFailed, walletReady, shortfall, activeKeys.length]);
-
-  const toggleOnline = useCallback(() => {
-    setError('');
-    if (!isOnline) {
-      if (blockers.length) {
-        setError(blockers[0]);
-        return;
-      }
-      if (locationStatus === 'denied') {
-        setError('Location is required to receive ride requests. Allow it in your settings, then try again.');
-        return;
-      }
-      if (locationStatus !== 'granted') {
-        setShowLocPrompt(true);
-        return;
-      }
-      firstLoadRef.current = true;
-      seenRef.current = new Set();
-      lastFixRef.current = Date.now();
-      onlineRef.current = true; // set before sending so the first location update says is_online: true
-      if (locRef.current) sendLocation(locRef.current);
-      setIsOnline(true);
-      persistOnline(true);
-      patchProfile({ online: true });
-    } else {
-      if (activeJob) {
-        setError('Finish your current trip before going offline.');
-        return;
-      }
-      onlineRef.current = false;
-      setIsOnline(false);
-      setAvailableJobs([]);
-      setAlertJob(null);
-      persistOnline(false);
-      patchProfile({ online: false });
-      if (locRef.current) {
-        call('/update-rider-location/', {
-          method: 'POST',
-          body: JSON.stringify({ rider_id: profileRef.current.rider_id, latitude: locRef.current.lat, longitude: locRef.current.lon, is_online: false }),
-        }).catch(() => {});
-      }
-    }
-  }, [isOnline, blockers, locationStatus, activeJob, patchProfile, sendLocation, call]);
-
-  // After the rider allows location from the prompt, continue going online automatically
-  useEffect(() => {
-    if (!pendingOnline) return;
-    if (locationStatus === 'granted') {
-      setPendingOnline(false);
-      toggleOnline();
-    } else if (locationStatus === 'denied' || locationStatus === 'error') setPendingOnline(false);
-  }, [pendingOnline, locationStatus, toggleOnline]);
-
-  // If an admin restricts the rider while they are online, take them offline (a trip in progress is left to finish)
-  useEffect(() => {
-    if (blocked && isOnline && !activeJob) {
-      onlineRef.current = false;
-      setIsOnline(false);
-      setAvailableJobs([]);
-      setAlertJob(null);
-      persistOnline(false);
-    }
-  }, [blocked, isOnline, activeJob]);
-
-  const openDeposit = (reason = '') => {
-    setSheetError(reason);
-    setDepositMethod('mobile_money');
-    setAmountInput(String(Math.max(Math.ceil(shortfall), 10) || 50));
-    setPhoneInput(profile.phone || '');
-    setNetworkInput(detectNetwork(profile.phone || ''));
-    setShowDeposit(true);
-  };
-  const openWithdraw = () => {
-    setSheetError('');
-    setAmountInput('');
-    setPhoneInput(profile.phone || '');
-    setNetworkInput(detectNetwork(profile.phone || ''));
-    setShowWithdraw(true);
+  const changeTab = (t: Tab) => {
+    if (t === tab) return;
+    setShown(false);
+    setTimeout(() => { setTab(t); store.set('rydn_dash_tab', t); setShown(true); window.scrollTo({ top: 0 }); }, 120);
   };
 
-  const acceptJob = async (booking: Booking) => {
-    setError('');
-    if (blocked) return setError(restricted ? 'Your account has been restricted by Rydnow. Contact support.' : 'Your account is still being verified.');
-    if (!isOnline || locationStatus !== 'granted') return setError('Go online with location enabled to accept jobs.');
-    if (!walletReady) {
-      setAlertJob(null);
-      return openDeposit(`Add GH₵ ${money(shortfall)} to your wallet to start accepting jobs.`);
+  // One tap, no confirmation. BACKEND: PATCH /auth/me/ { online } + start sending GPS to /update-rider-location/
+  const toggleOnline = () => {
+    if (online) {
+      if (job) return notify('Finish your current trip before going offline.', 'err');
+      setOnline(false); setOnlineSince(null); setOffer(null);
+      return notify('You’re offline.', 'info');
     }
-    setBusyId(String(booking.id));
-    try {
-      const res = await call('/accept-booking/', { method: 'POST', body: JSON.stringify({ booking_id: booking.id, rider_id: profile.rider_id }) });
-      const data = await res.json().catch(() => ({}));
-      if (res.ok) {
-        setActiveJob(data.booking || { ...booking, status: 'assigned', rider: profile.rider_id });
-        setAvailableJobs(prev => prev.filter(j => String(j.id) !== String(booking.id)));
-        setAlertJob(null);
-        setActiveTab('home');
-        notify('Job accepted. Head to the pickup point.', 'success');
-      } else if (res.status === 409) {
-        setAvailableJobs(prev => prev.filter(j => String(j.id) !== String(booking.id)));
-        setAlertJob(null);
-        notify('Another rider took this job.', 'info');
-      } else if (/wallet|deposit|balance/i.test(String(data.detail || data.message || ''))) {
-        fetchWallet();
-        setAlertJob(null);
-        openDeposit(String(data.detail || data.message));
-      } else setError(String(data.detail || data.message || 'Could not accept this job. Try again.'));
-    } catch {
-      setError('Network error. Check your connection and try again.');
-    } finally {
-      setBusyId(null);
-    }
+    if (docState === 'action') return notify('Fix your documents in Account before going online.', 'err');
+    if (svc !== 'ride' && walletBal < MIN_DEPOSIT) return notify(`Minimum deposit: ${MIN_DEPOSIT} GHS is required to receive delivery jobs. Top up in your Wallet.`, 'err');
+    setOnline(true); setOnlineSince(Date.now());
+    notify(onBreak ? 'You’re online, but on a break. Offers are paused.' : 'You’re online. Looking for jobs…', onBreak ? 'info' : 'ok');
   };
 
-  const tripAction = async (path: string, nextStatus: string, failMsg: string) => {
-    if (!activeJob) return;
-    setBusyId(String(activeJob.id));
-    try {
-      const res = await call(path, { method: 'POST', body: JSON.stringify({ booking_id: activeJob.id, rider_id: profile.rider_id }) });
-      if (res.ok) {
-        if (nextStatus === 'completed') {
-          const earn = earnOf(activeJob);
-          setSummary({
-            service: SERVICE_META[normalizeService(activeJob.service_type)].label,
-            pickup: activeJob.pickup,
-            destination: activeJob.destination,
-            km: tripRoute?.km,
-            min: tripRoute?.min,
-            fare: fareOf(activeJob),
-            earn,
-          });
-          pushNote('payment', 'Trip completed', `About GH₵ ${money(earn)} was added to your wallet.`, 'wallet');
-          setProfile(p => ({ ...p, completed_jobs: p.completed_jobs + 1 }));
-          setActiveJob(null);
-          fetchWallet();
-          fetchTransactions();
-          fetchBookings();
-        } else setActiveJob(prev => (prev ? { ...prev, status: nextStatus } : prev));
-      } else {
-        const d = await res.json().catch(() => ({}));
-        setError(String(d.detail || d.message || failMsg));
-      }
-    } catch {
-      setError(failMsg);
-    } finally {
-      setBusyId(null);
-    }
+  // Pull-to-refresh / manual refresh. BACKEND: re-fetch bookings, wallet, profile, notifications here.
+  const refresh = async () => {
+    if (refreshing) return;
+    if (!netOnline) return notify('You’re offline. We’ll refresh when you reconnect.', 'err');
+    setRefreshing(true); setLoading(true);
+    await new Promise(r => setTimeout(r, 900));
+    setLoading(false); setRefreshing(false); setLastSynced(Date.now());
+    notify('Up to date.', 'ok');
+  };
+  const onTouchStart = (e: React.TouchEvent) => { if (window.scrollY <= 0) touchY.current = e.touches[0].clientY; };
+  const onTouchMove = (e: React.TouchEvent) => { if (touchY.current !== null) setPull(Math.min(80, Math.max(0, e.touches[0].clientY - touchY.current))); };
+  const onTouchEnd = () => { if (pull > 60) refresh(); touchY.current = null; setPull(0); };
+
+  const changeService = (id: string, name: string) => {
+    if (job) return notify('Finish your current trip before switching service.', 'err');
+    setSvc(id); setOffer(null); touchSync(); // BACKEND: PATCH /rider-services/active/ { service: id }
+    notify(`Service updated to: ${name}. Jobs for this service will now appear.`, 'ok');
   };
 
-  const toggleService = (key: ServiceKey) => {
-    if (activeJob) return notify('Complete your current trip first.', 'error');
-    const next = services.map(s => (s.key === key ? { ...s, active: !s.active } : s));
-    const nextActive = next.filter(s => s.approved && s.active);
-    if (nextActive.length === 0) return notify('Keep at least one service on.', 'error');
-    setProfile(p => ({ ...p, services: next }));
-    writeJSON('rydn_rider', { ...readJSON<Record<string, unknown>>('rydn_rider', {}), services: next });
-    patchProfile({ active_services: nextActive.map(s => s.key) });
+  const sendMsg = (text: string) => {
+    const id = `m${Date.now()}`;
+    setMsgs(m => [...m, { id, from: 'rider', text, at: Date.now(), read: false }]); // BACKEND: POST /bookings/{id}/messages/ or websocket send
+    setTimeout(() => setMsgs(m => m.map(x => (x.id === id ? { ...x, read: true } : x))), 1500); // demo read receipt
+  };
+  const addSystemMsg = (text: string) => setMsgs(m => [...m, { id: `s${Date.now()}${m.length}`, from: 'system', text, at: Date.now() }]);
+
+  const acceptOffer = () => {
+    if (offer) {
+      setJob({ ...offer, stage: 'pickup' }); setMsgs([]); setOffer(null); notify('Job accepted. Head to pickup.', 'ok');
+      pushNote('jobs', '✅', 'Job accepted', `${offer.from} → ${offer.to}`);
+    }
+  }; // BACKEND: POST /accept-booking/
+  const advance = () => {
+    if (!job) return;
+    if (job.stage === 'pickup') { // BACKEND: POST /arrive-ride/
+      setJob({ ...job, stage: 'arrived' });
+      addSystemMsg('You arrived. Say hello to the customer.');
+      setChatOpen(true); // chat opens automatically on arrival
+      return;
+    }
+    if (job.stage === 'arrived') return setJob({ ...job, stage: 'trip' }); // BACKEND: POST /start-ride/
+    setProofOpen(true); // trip finished: proof of delivery comes first, then the job completes
   };
 
-  const requestService = async (key: ServiceKey) => {
-    try {
-      const res = await call('/rider-service-request/', { method: 'POST', body: JSON.stringify({ rider_id: profile.rider_id, service: key }) });
-      if (res.ok) {
-        setRequestedServices(prev => [...prev, key]);
-        notify(`Request sent for ${SERVICE_META[key].label}. We’ll review it soon.`, 'success');
-      } else notify('Could not send your request. Try again.', 'error');
-    } catch {
-      notify('Network error. Try again.', 'error');
-    }
+  // Runs after proof is submitted. BACKEND: POST /complete-ride/ (multipart: proof image or scanned code), server credits the wallet.
+  const completeJob = async (proof: { file?: File; code?: string }) => {
+    if (!job) return;
+    await new Promise(r => setTimeout(r, 900));
+    const fee = +(job.fare * 0.15).toFixed(2);
+    const bonus = inPeak ? +(job.fare * 0.1).toFixed(2) : 0;
+    const net = job.fare - fee + bonus;
+    const proofRef = proof.file ? URL.createObjectURL(proof.file) : `code:${proof.code}`;
+    setHistory(h => [{ id: `J-${1043 + h.length}`, at: Date.now(), from: job.from, to: job.to, base: job.fare, fee, bonus, method: job.method, km: job.km, proof: proofRef }, ...h]);
+    setWalletBal(b => +(b + net).toFixed(2));
+    addSystemMsg('Delivery completed — proof submitted');
+    pushNote('earnings', '💰', 'Payment received', `GH₵ ${money(net)} added to your wallet.`, 'View');
+    pushNote('jobs', '📎', 'Proof of delivery uploaded', `${job.from} → ${job.to}`);
+    setProofOpen(false); setChatOpen(false);
+    notify(`Delivery Completed ✅ +GH₵ ${money(net)}`, 'ok');
+    setJob(null); touchSync();
   };
 
-  const submitMoney = async (kind: 'deposit' | 'withdraw') => {
-    const amount = round2(parseFloat(amountInput));
-    const viaCard = kind === 'deposit' && depositMethod === 'card';
-    if (kind === 'deposit') {
-      const min = walletReady ? 10 : Math.max(shortfall, 1);
-      if (!amount || amount < min) return setSheetError(`The minimum deposit is GH₵ ${money(min)}.`);
-    } else {
-      if (!amount || amount <= 0) return setSheetError('Enter the amount you want to withdraw.');
-      if (amount > withdrawable)
-        return setSheetError(`You can withdraw up to GH₵ ${money(withdrawable)}. GH₵ ${MIN_WALLET_BALANCE} stays in your wallet so you can keep accepting jobs.`);
-    }
-    if (!viaCard) {
-      if (!isValidMomo(phoneInput)) return setSheetError('Enter a valid 10-digit Mobile Money number, e.g. 054 123 4567.');
-      if (!networkInput) return setSheetError('Choose your Mobile Money network.');
-    }
-    setSheetBusy(true);
-    setSheetError('');
-    try {
-      const payload = viaCard
-        ? { rider_id: profile.rider_id, amount, method: 'card', callback_url: `${window.location.origin}${window.location.pathname}` }
-        : {
-            rider_id: profile.rider_id,
-            amount,
-            ...(kind === 'deposit' ? { method: 'mobile_money' } : {}),
-            mobile_money_number: normalizeGhPhone(phoneInput),
-            network: networkInput,
-          };
-      const res = await call(kind === 'deposit' ? '/rider-deposit/' : '/request-withdrawal/', { method: 'POST', body: JSON.stringify(payload) });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) return setSheetError(String(data.detail || data.message || 'Something went wrong. Try again.'));
-      if (viaCard) {
-        const url = data.authorization_url || data.payment_url || data.checkout_url || data.redirect_url;
-        if (!url) return setSheetError('We couldn’t open the secure payment page. Try again.');
-        try {
-          sessionStorage.setItem('rydn_dep_start', String(wallet.balance));
-        } catch {
-          /* ignore */
-        }
-        window.location.assign(String(url));
-        return;
-      }
-      if (kind === 'deposit') {
-        depositStartBalance.current = wallet.balance;
-        setDepositWaitingUntil(Date.now() + 120000);
-        setShowDeposit(false);
-        notify('Check your phone and approve the Mobile Money prompt.', 'info', 6000);
-      } else {
-        setShowWithdraw(false);
-        notify(`Withdrawal of GH₵ ${money(amount)} requested. Status: pending.`, 'success', 5000);
-        pushNote('payment', 'Withdrawal requested', `GH₵ ${money(amount)} to ${normalizeGhPhone(phoneInput)} is pending.`, 'wallet');
-        fetchWallet();
-        fetchTransactions();
-      }
-    } catch {
-      setSheetError('Network error. Check your connection and try again.');
-    } finally {
-      setSheetBusy(false);
-    }
+  const onWalletDeposit = (a: number, d: NonNullable<Dest>) => {
+    setWalletBal(b => +(b + a).toFixed(2)); setDest(d); touchSync();
+    setTxns(t => [{ id: `t${Date.now()}`, kind: 'deposit', label: `Deposit · ${d.masked}`, amount: a, at: Date.now() }, ...t]);
+    pushNote('earnings', '', 'Deposit received', `GH₵ ${money(a)} added to your wallet.`);
+  };
+  const onWalletWithdraw = (a: number) => {
+    setWalletBal(b => +(b - a).toFixed(2)); touchSync();
+    setTxns(t => [{ id: `t${Date.now()}`, kind: 'withdraw', label: `Withdrawal · ${dest?.masked ?? ''}`, amount: -a, at: Date.now() }, ...t]);
+    pushNote('earnings', '', 'Withdrawal processed', `GH₵ ${money(a)} sent to ${dest?.masked ?? 'your account'}.`);
   };
 
   const saveProfile = async () => {
-    if (!editForm.name.trim()) return setSheetError('Enter your full name.');
-    if (editForm.phone && !isValidMomo(editForm.phone)) return setSheetError('Enter a valid 10-digit phone number.');
-    setSheetBusy(true);
-    setSheetError('');
-    const res = await patchProfile({ name: editForm.name.trim(), phone: editForm.phone ? normalizeGhPhone(editForm.phone) : '', email: editForm.email.trim() });
-    setSheetBusy(false);
-    if (res && res.ok) {
-      const next = { ...profile, name: editForm.name.trim(), phone: editForm.phone ? normalizeGhPhone(editForm.phone) : '', email: editForm.email.trim() };
-      setProfile(next);
-      writeJSON('rydn_rider', { ...readJSON<Record<string, unknown>>('rydn_rider', {}), ...next });
-      setShowEdit(false);
-      notify('Profile updated.', 'success');
-    } else setSheetError('We couldn’t save your changes. Try again.');
-  };
-
-  const updatePrefs = (patch: Partial<Prefs>) => {
-    const next = { ...prefs, ...patch };
-    setPrefs(next);
-    writeJSON('rydn_prefs', next);
-  };
-
-  const shareText = async (title: string, text: string, okMsg: string) => {
-    if (navigator.share) {
-      try {
-        await navigator.share({ title, text });
-      } catch {
-        /* closed */
-      }
-      return;
-    }
+    if (!form.name.trim()) return notify('Enter your full name.', 'err');
+    if (!/^0\d{9}$/.test(form.phone.replace(/\s/g, ''))) return notify('Enter a valid 10-digit phone number.', 'err');
+    setSaving(true);
     try {
-      await navigator.clipboard.writeText(text);
-      notify(okMsg, 'success');
+      await new Promise(r => setTimeout(r, 700)); // BACKEND: PATCH /auth/me/ { name, phone, email }
+      setRider(r => ({ ...r, ...form }));
+      setEditing(false); touchSync(); notify('Profile updated.', 'ok');
     } catch {
-      notify('Sharing isn’t available on this device.', 'error');
-    }
+      notify('We couldn’t save your changes. Please try again.', 'err'); // never show technical details
+    } finally { setSaving(false); }
   };
 
-  const shareReceipt = (j: Booking) =>
-    shareText(
-      'Rydnow receipt',
-      [
-        `RYDNOW receipt #${j.id}`,
-        SERVICE_META[normalizeService(j.service_type)].label,
-        j.created_at ? new Date(j.created_at).toLocaleString('en-GH') : '',
-        `${j.pickup}${j.destination !== j.pickup ? ` → ${j.destination}` : ''}`,
-        `Fare: GH₵ ${money(fareOf(j))}`,
-        `Earnings after fee: GH₵ ${money(earnOf(j))}`,
-      ]
-        .filter(Boolean)
-        .join('\n'),
-      'Receipt copied.'
-    );
+  const saveGoal = (v: number) => {
+    if (!(v >= 10)) return notify('Pick a goal of GH₵ 10 or more.', 'err');
+    setGoal(v); store.set('rydn_goal', String(v)); setGoalOpen(false); touchSync(); notify('Daily goal updated.', 'ok');
+  };
+  const updateSched = (i: number, patch: Partial<Sched>) => {
+    setSched(prev => {
+      const next = prev.map((s, idx) => (idx === i ? { ...s, ...patch } : s));
+      if (next[i].to <= next[i].from) next[i] = { ...next[i], to: Math.min(24, next[i].from + 1) };
+      store.set('rydn_sched', JSON.stringify(next)); // BACKEND: PUT /rider-schedule/
+      return next;
+    });
+    touchSync();
+  };
+  const setTheme = (t: ThemePref) => { setThemePref(t); store.set('rydn_theme', t); };
+  const toggleBreak = (v: boolean) => { setOnBreak(v); store.set('rydn_break', v ? '1' : '0'); if (v) setOffer(null); notify(v ? 'Break on. Job offers are paused.' : 'Welcome back. Offers resumed.', v ? 'info' : 'ok'); touchSync(); };
+  const setQuietHours = (v: boolean) => { setQuiet(v); store.set('rydn_quiet', v ? '1' : '0'); }; // BACKEND: PATCH notification prefs
 
-  const inviteLink = (path: string) => `${typeof window !== 'undefined' ? window.location.origin : ''}${path}?ref=${myReferralCode}`;
-  const inviteMessage = () =>
-    inviteAudience === 'riders'
-      ? `Earn money with Rydnow. Sign up as a rider with my code ${myReferralCode}: ${inviteLink(RIDER_SIGNUP_PATH)}`
-      : `Ride, send parcels and book pickups with Rydnow. Use my code ${myReferralCode} to get GH₵ ${CUSTOMER_FRIEND_DISCOUNT} off your first booking: ${inviteLink(CUSTOMER_SIGNUP_PATH)}`;
-
-  // One-time snapshot of the rider's position (a map link), not a continuously updating live share
-  const safetyShareLink = () => {
-    const where = currentLocation ? `https://www.google.com/maps?q=${currentLocation.lat},${currentLocation.lon}` : 'location unavailable';
-    const trip = activeJob ? ` Trip: ${activeJob.pickup} to ${activeJob.destination}.` : '';
-    return `https://wa.me/?text=${encodeURIComponent(`I’m on a Rydnow job. My location: ${where}.${trip}`)}`;
+  const setActiveVehicle = (id: string) => {
+    const v = vehicles.find(x => x.id === id);
+    if (!v || v.active) return;
+    if (job) return notify('Finish your current trip first.', 'err');
+    if (v.status !== 'verified') return notify('This vehicle needs verified documents first.', 'err');
+    setVehicles(vs => vs.map(x => ({ ...x, active: x.id === id }))); // BACKEND: PATCH /rider-vehicles/{id}/ { active: true }
+    touchSync(); notify(`${v.model} is now your active vehicle.`, 'ok');
+  };
+  const submitVehicle = () => {
+    if (!vehForm.model.trim() || !vehForm.plate.trim()) return notify('Enter the model and plate number.', 'err');
+    setVehicles(vs => [...vs, { id: `v${vs.length + 1}`, model: vehForm.model.trim(), plate: vehForm.plate.trim().toUpperCase(), color: vehForm.color.trim() || '—', active: false, status: 'pending', service: '2027-03-01', kmLeft: 3000 }]); // BACKEND: POST /rider-vehicles/ then open document upload
+    setAddVeh(false); setVehForm({ model: '', plate: '', color: '' }); touchSync(); notify('Vehicle added. Upload its documents to verify it.', 'ok');
   };
 
-  const logout = () => {
-    patchProfile({ online: false });
-    clearSession();
-    router.replace(LOGIN_PATH);
+  const submitPw = async () => {
+    if (!pw.cur) return notify('Enter your current password.', 'err');
+    if (pw.next.length < 8 || strength(pw.next) < 3) return notify('Choose a stronger password.', 'err');
+    if (pw.next !== pw.again) return notify('The new passwords don’t match.', 'err');
+    setSaving(true);
+    await new Promise(r => setTimeout(r, 700)); // BACKEND: POST /auth/change-password/
+    setSaving(false); setPwOpen(false); setPw({ cur: '', next: '', again: '' }); notify('Password changed.', 'ok');
+  };
+  const enable2FA = () => {
+    if (!/^\d{6}$/.test(code)) return notify('Enter the 6-digit code we sent you.', 'err');
+    setTwoFA(true); setTwoFAOpen(false); setCode(''); notify('Two-factor authentication is on.', 'ok'); // BACKEND: POST /auth/2fa/verify/
   };
 
-  const openNote = (n: Note) => {
-    setNotes(prev => prev.map(x => (x.id === n.id ? { ...x, read: true } : x)));
-    if (n.tab) setActiveTab(n.tab);
+  const openNoteAction = (n: Note) => {
+    setNotes(p => p.map(x => (x.id === n.id ? { ...x, read: true } : x)));
+    setNotesOpen(false);
+    if (n.group === 'jobs') window.open(`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent('Accra Mall, Accra, Ghana')}`, '_blank', 'noopener');
+    else changeTab(n.group === 'earnings' ? 'jobs' : 'account');
   };
+  const emergency = () => {
+    window.open(`https://wa.me/233${EMERGENCY.phone.slice(1)}?text=${encodeURIComponent(`EMERGENCY. ${tripMsg}`)}`, '_blank', 'noopener');
+    window.location.href = `tel:${EMERGENCY.phone}`;
+  };
+  const dismissGuide = () => { setGuideOpen(false); store.set('rydn_guide_seen', todayKey()); };
+  const logout = () => notify('Signed out (connect your logout route).', 'info'); // BACKEND: clear token, router.replace('/login')
 
   // ─── RENDER HELPERS (plain functions so inputs keep focus) ───
-  const locationLabel =
-    locationStatus === 'granted'
-      ? { icon: '✅', text: locStale ? 'Location not updating' : 'Location shared' }
-      : locationStatus === 'requesting'
-      ? { icon: '⏳', text: 'Requesting location…' }
-      : { icon: '⚠️', text: 'Location off — tap to enable' };
-
-  const statusBadge = restricted
-    ? { text: statusKey === 'suspended' ? 'Suspended' : 'Restricted', cls: 'bg-red-500/15 text-red-300', icon: 'lock' }
-    : unverified
-    ? { text: 'Verification pending', cls: 'bg-[#F5B82E]/15 text-[#F5B82E]', icon: 'clock' }
-    : { text: 'Verified', cls: 'bg-emerald-500/15 text-emerald-300', icon: 'check' };
-
-  const header = (title: string) => (
-    <header className="flex items-center justify-between px-5 pb-3 pt-[calc(1rem+env(safe-area-inset-top))]">
-      {activeTab === 'home' ? (
-        <button onClick={() => setShowSafety(true)} aria-label="Safety and emergency" className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/80">
-          <Icon name="shield" />
-        </button>
-      ) : (
-        <button onClick={() => setActiveTab('home')} aria-label="Back to home" className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/5 text-white/80">
-          <Icon name="back" />
-        </button>
-      )}
-      <h1 className={`${DISPLAY} text-xl font-bold tracking-tight`}>{title}</h1>
-      <button
-        onClick={() => setActiveTab('profile')}
-        aria-label="Open profile"
-        className="flex h-10 w-10 items-center justify-center overflow-hidden rounded-full border-2 border-[#4AA3FF]/60 bg-white/10 text-white/80"
-      >
-        {profile.photo_url ? <Image src={profile.photo_url} alt="" width={40} height={40} unoptimized className="h-10 w-10 object-cover" /> : <Icon name="user" />}
-      </button>
-    </header>
+  const gate = (h: string, node: ReactNode) => (loading ? <div className={`animate-pulse rounded-3xl ${K.skel} ${h}`} aria-busy="true" aria-label="Loading" /> : node);
+  const card = (extra = '') => `rounded-3xl p-4 ${K.card} ${extra}`;
+  const primary = `${TAP} rounded-full ${K.btn} px-4 text-sm font-extrabold ${PRESS}`;
+  const ghost = `${TAP} rounded-full border ${K.line} px-4 text-sm font-bold ${K.ink} ${PRESS}`;
+  const gold = `${TAP} rounded-full bg-[#F9D342] px-4 text-sm font-extrabold text-[#0A2342] ${PRESS}`;
+  const chip = (on: boolean) => `${TAP} shrink-0 rounded-full border px-4 text-xs font-bold transition ${on ? 'border-[#F9D342] bg-[#F9D342] text-[#0A2342]' : `${K.line} ${K.sub}`}`;
+  const empty = (icon: IconName, title: string, body: string) => (
+    <div className={`${card()} py-8 text-center`}><span className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-[#F9D342]/25"><Icon name={icon} className="h-7 w-7" /></span><p className={`mt-2 font-extrabold ${K.ink}`}>{title}</p><p className={`mt-1 text-sm ${K.sub}`}>{body}</p></div>
+  );
+  const trend = (d: number, goodWhenUp = true) => {
+    const good = goodWhenUp ? d >= 0 : d <= 0;
+    return <span className={`text-xs font-extrabold ${d === 0 ? K.faint : good ? 'text-emerald-500' : 'text-red-500'}`} aria-label={good ? 'improving' : 'declining'}>{d === 0 ? '–' : d > 0 ? '↑' : '↓'} {Math.abs(d)}%</span>;
+  };
+  const field = (label: string, key: 'name' | 'phone' | 'email', type = 'text') => (
+    <label className="block">
+      <span className={`mb-1 block text-xs font-semibold ${K.faint}`}>{label}</span>
+      {editing ? <input type={type} value={form[key]} onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))} className={`${TAP} w-full rounded-xl border px-3 text-base outline-none focus:ring-2 focus:ring-[#F9D342] ${K.input}`} /> : <p className={`py-1 font-semibold ${K.ink}`}>{rider[key]}</p>}
+    </label>
+  );
+  const input = (label: string, value: string, onChange: (v: string) => void, type = 'text', ph = '') => (
+    <label className="mb-3 block"><span className={`mb-1 block text-xs font-semibold ${K.faint}`}>{label}</span>
+      <input type={type} value={value} placeholder={ph} onChange={e => onChange(e.target.value)} className={`${TAP} w-full rounded-xl border px-3 text-base outline-none focus:ring-2 focus:ring-[#F9D342] ${K.input}`} /></label>
   );
 
-  const gateBanner = () => {
-    if (!walletLoaded) {
-      return (
-        <div className={`${CARD} flex items-center gap-3 p-4`}>
-          {walletFailed ? (
-            <>
-              <p className="flex-1 text-sm text-white/70">We couldn’t load your wallet.</p>
-              <button onClick={fetchWallet} className={`${BTN_GHOST} inline-flex items-center gap-2 px-4 py-2 text-xs`}>
-                <Icon name="refresh" className="h-3.5 w-3.5" /> Retry
-              </button>
-            </>
-          ) : (
-            <>
-              <Spinner />
-              <p className="text-sm text-white/60">Checking your wallet…</p>
-            </>
-          )}
-        </div>
-      );
-    }
-    if (walletReady) return null;
-    const pct = Math.min(100, Math.round((wallet.balance / MIN_WALLET_BALANCE) * 100));
+  const syncRow = () => {
+    const s = !netOnline ? 'offline' : syncing ? 'syncing' : 'saved';
+    const txt = s === 'offline' ? 'Offline — using cached data. Reconnecting…' : s === 'syncing' ? 'Syncing…' : `All changes saved · ${ago(lastSynced)}`;
     return (
-      <div className="rounded-3xl border border-[#F5B82E]/40 bg-[#F5B82E]/10 p-4">
-        <div className="flex items-start gap-3">
-          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[#F5B82E] text-[#2A1B00]">
-            <Icon name="lock" className="h-4 w-4" />
-          </span>
-          <div className="flex-1">
-            <p className="text-sm font-bold">Deposit GH₵ {money(shortfall)} to start accepting jobs</p>
-            <p className="mt-0.5 text-xs text-white/60">Riders keep at least GH₵ {MIN_WALLET_BALANCE} in their wallet. It covers service fees and stays yours.</p>
-          </div>
-        </div>
-        <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/10">
-          <div className="h-full rounded-full bg-[#F5B82E] transition-all" style={{ width: `${pct}%` }} />
-        </div>
-        <div className="mt-1.5 flex justify-between text-[11px] text-white/50">
-          <span>GH₵ {money(wallet.balance)}</span>
-          <span>GH₵ {MIN_WALLET_BALANCE}</span>
-        </div>
-        <button onClick={() => openDeposit()} className={`${BTN_GOLD} mt-3 w-full py-3 text-sm`}>
-          Deposit now
-        </button>
+      <div className={`flex items-center justify-between gap-2 rounded-2xl pl-3 text-xs font-semibold ${s === 'offline' ? 'bg-red-100 text-red-700' : s === 'syncing' ? 'bg-amber-100 text-amber-800' : `${K.soft} ${K.sub}`}`} role="status">
+        <span className="flex items-center gap-1.5"><Icon name={s === 'offline' ? 'alert' : s === 'syncing' ? 'refresh' : 'check'} className="h-4 w-4 shrink-0" />{txt}</span>
+        <button onClick={refresh} aria-label="Refresh now" className="flex h-11 w-11 items-center justify-center rounded-full">{refreshing ? <Spinner cls="h-4 w-4" /> : <Icon name="refresh" className="h-4 w-4" />}</button>
       </div>
     );
   };
-
-  const restrictedCard = () =>
-    blocked ? (
-      <div className={`rounded-3xl border p-4 ${restricted ? 'border-red-400/30 bg-red-500/10' : 'border-[#F5B82E]/40 bg-[#F5B82E]/10'}`} role="alert">
-        <p className={`text-sm font-bold ${restricted ? 'text-red-200' : 'text-[#FFD25E]'}`}>{restricted ? 'Account restricted' : 'Verification in progress'}</p>
-        <p className="mt-1 text-xs text-white/60">
-          {restricted
-            ? 'Rydnow has restricted your account, so you can’t go online or accept jobs right now. Contact support to find out why and how to get back online.'
-            : 'We’re still checking your documents. You’ll be able to go online as soon as you’re approved, and we’ll send you a notification.'}
-        </p>
-        {SUPPORT_PHONE && (
-          <a href={`tel:${SUPPORT_PHONE}`} className={`${BTN_GHOST} mt-3 block w-full py-2.5 text-center text-xs`}>
-            Call support
-          </a>
-        )}
-      </div>
-    ) : null;
-
-  const routeLine = (pickup: string, destination: string, light = false) => {
-    const same = pickup === destination;
-    return (
-      <div className="flex gap-3">
-        <div className="flex flex-col items-center pt-1.5">
-          <span className="h-2.5 w-2.5 rounded-full bg-[#4AA3FF]" />
-          {!same && (
-            <>
-              <span className={`my-1 w-px flex-1 ${light ? 'bg-white/30' : 'bg-white/15'}`} />
-              <span className="h-2.5 w-2.5 rounded-[2px] bg-[#FFC83D]" />
-            </>
-          )}
-        </div>
-        <div className="min-w-0 flex-1 space-y-2">
-          <p className="truncate text-sm font-semibold">{pickup}</p>
-          {!same && <p className="truncate text-sm font-semibold">{destination}</p>}
-        </div>
-      </div>
-    );
-  };
-
-  const jobCard = (job: Booking) => {
-    const svc = SERVICE_META[normalizeService(job.service_type)];
-    const pu = toLatLon(job.pickup_lat, job.pickup_lng);
-    const away = currentLocation && pu ? distanceKm(currentLocation, pu) : null;
-    const isWaste = normalizeService(job.service_type) === 'waste-bin' || job.pickup === job.destination;
-    return (
-      <div key={String(job.id)} className={`${CARD} p-4`}>
-        <div className="mb-3 flex items-center gap-3">
-          <Image src={svc.icon} alt="" width={36} height={36} className="h-9 w-9 object-contain" />
-          <div className="min-w-0 flex-1">
-            <p className="text-sm font-bold">{svc.label}</p>
-            <p className="text-xs text-white/50">{away !== null ? `${away.toFixed(1)} km to pickup` : 'New request'}</p>
-          </div>
-          <div className="text-right">
-            <p className="text-lg font-bold text-[#6DB7FF]">GH₵ {money(fareOf(job))}</p>
-            <p className="text-[11px] font-semibold text-emerald-400">You earn ~GH₵ {money(earnOf(job))}</p>
-          </div>
-        </div>
-        {routeLine(job.pickup, isWaste ? job.pickup : job.destination)}
-        {(job.parcel_details || job.delivery_category) && (
-          <p className="mt-3 rounded-xl bg-white/5 px-3 py-2 text-xs text-white/70">
-            {job.delivery_category ? `${job.delivery_category}: ` : ''}
-            {job.parcel_details}
-          </p>
-        )}
-        <div className="mt-4 flex gap-3">
-          <button onClick={() => declineJob(job.id)} className={`${BTN_GHOST} flex-1 py-3 text-sm`}>
-            Decline
-          </button>
-          <button
-            onClick={() => acceptJob(job)}
-            disabled={busyId === String(job.id)}
-            className={`${walletReady ? BTN_PRIMARY : BTN_GOLD} flex flex-[2] items-center justify-center gap-2 py-3 text-sm`}
-          >
-            {busyId === String(job.id) && <Spinner />}
-            {walletReady ? 'Accept job' : 'Deposit to accept'}
-          </button>
-        </div>
-      </div>
-    );
-  };
-
-  const tripRow = (j: Booking, withReceipt = false) => {
-    const svc = SERVICE_META[normalizeService(j.service_type)];
-    const cancelled = j.status === 'cancelled';
-    return (
-      <div key={String(j.id)} className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/[0.04] p-3">
-        <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-[#4AA3FF]/40 bg-[#1F6BFF]/15">
-          <Image src={svc.icon} alt="" width={26} height={26} className="h-6 w-6 object-contain" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-semibold">
-            {j.pickup}
-            {j.destination !== j.pickup ? ` → ${j.destination}` : ''}
-          </p>
-          <p className="text-xs text-white/45">
-            {shortDate(j.created_at)} · {svc.label}
-            {cancelled ? ' · Cancelled' : ''}
-          </p>
-        </div>
-        <div className="text-right">
-          <p className={`text-sm font-bold ${cancelled ? 'text-white/40 line-through' : 'text-white'}`}>GH₵ {money(fareOf(j))}</p>
-          {withReceipt && !cancelled && (
-            <button onClick={() => shareReceipt(j)} className="mt-0.5 inline-flex items-center gap-1 text-[11px] font-bold text-[#6DB7FF]">
-              <Icon name="receipt" className="h-3 w-3" /> Receipt
-            </button>
-          )}
-        </div>
-      </div>
-    );
-  };
-
-  const closeDeposit = useCallback(() => setShowDeposit(false), []);
-  const closeWithdraw = useCallback(() => setShowWithdraw(false), []);
-
-  const paySheet = (kind: 'deposit' | 'withdraw') => (
-    <Sheet title={kind === 'deposit' ? 'Deposit to wallet' : 'Withdraw earnings'} onClose={kind === 'deposit' ? closeDeposit : closeWithdraw} locked={sheetBusy}>
-      {kind === 'deposit' ? (
-        <>
-          <p className="mb-4 text-sm text-white/60">
-            {walletReady ? 'Top up your wallet by Mobile Money or card.' : `You need GH₵ ${MIN_WALLET_BALANCE} in your wallet to accept jobs. Add at least GH₵ ${money(shortfall)}.`}
-          </p>
-          <p className={LABEL}>Pay with</p>
-          <div className="mb-4 grid grid-cols-2 gap-2">
-            {(
-              [
-                ['mobile_money', 'Mobile Money', 'MTN · Telecel · AT'],
-                ['card', 'Visa / Debit card', 'Visa · Mastercard'],
-              ] as const
-            ).map(([id, label, sub]) => (
-              <button
-                key={id}
-                onClick={() => {
-                  setDepositMethod(id);
-                  setSheetError('');
-                }}
-                aria-pressed={depositMethod === id}
-                className={`rounded-2xl border-2 p-3 text-left transition ${depositMethod === id ? CHIP_ON : CHIP_OFF}`}
-              >
-                <span className="block text-sm font-bold">{label}</span>
-                <span className="block text-[11px] text-white/50">{sub}</span>
-              </button>
-            ))}
-          </div>
-          <div className="mb-3 flex gap-2">
-            {[50, 100, 200].map(v => (
-              <button key={v} onClick={() => setAmountInput(String(v))} className={`flex-1 rounded-xl border-2 py-2 text-sm font-bold ${amountInput === String(v) ? CHIP_ON : CHIP_OFF}`}>
-                GH₵ {v}
-              </button>
-            ))}
-          </div>
-        </>
-      ) : (
-        <>
-          <p className="mb-1 text-sm text-white/60">
-            Available to withdraw: <span className="font-bold text-[#6DB7FF]">GH₵ {money(withdrawable)}</span>
-          </p>
-          <p className="mb-4 text-xs text-white/40">GH₵ {MIN_WALLET_BALANCE} stays in your wallet so you can keep accepting jobs.</p>
-        </>
-      )}
-      <label htmlFor="pay-amount" className={LABEL}>
-        Amount (GH₵)
-      </label>
-      <div className="mb-3 flex gap-2">
-        <input id="pay-amount" type="number" inputMode="decimal" value={amountInput} onChange={e => setAmountInput(e.target.value)} placeholder="0.00" className={`${INPUT} text-lg font-bold`} />
-        {kind === 'withdraw' && (
-          <button onClick={() => setAmountInput(money(withdrawable))} className={`${BTN_GHOST} px-4 text-sm`}>
-            Max
-          </button>
-        )}
-      </div>
-      {kind === 'deposit' && depositMethod === 'card' ? (
-        <div className="mb-4 rounded-2xl border border-white/10 bg-white/5 p-4">
-          <div className="mb-2 flex items-center gap-2">
-            <span className="rounded-md bg-white px-2 py-1 text-[11px] font-bold italic text-[#1A1F71]">VISA</span>
-            <span className="flex h-6 w-10 items-center justify-center rounded-md bg-white">
-              <span className="-mr-1.5 h-3.5 w-3.5 rounded-full bg-[#EB001B]" />
-              <span className="h-3.5 w-3.5 rounded-full bg-[#F79E1B] opacity-90" />
-            </span>
-            <span className="text-xs font-semibold text-white/70">Debit & credit cards</span>
-          </div>
-          <p className="text-xs text-white/60">You’ll be taken to a secure payment page to enter your card details. Rydnow never sees or stores your card number.</p>
-        </div>
-      ) : (
-        <>
-          <label htmlFor="pay-phone" className={LABEL}>
-            Mobile Money number
-          </label>
-          <input
-            id="pay-phone"
-            type="tel"
-            inputMode="tel"
-            placeholder="e.g. 054 123 4567"
-            value={phoneInput}
-            onChange={e => {
-              setPhoneInput(e.target.value);
-              const n = detectNetwork(e.target.value);
-              if (n) setNetworkInput(n);
-            }}
-            className={`${INPUT} mb-3`}
-          />
-          <p className={LABEL}>Network</p>
-          <div className="mb-4 grid grid-cols-3 gap-2">
-            {(['MTN', 'Telecel', 'AirtelTigo'] as const).map(n => (
-              <button key={n} onClick={() => setNetworkInput(n)} className={`rounded-xl border-2 py-2.5 text-xs font-bold ${networkInput === n ? CHIP_ON : CHIP_OFF}`}>
-                {n === 'AirtelTigo' ? 'AT Money' : n}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-      {sheetError && (
-        <p className="mb-3 rounded-xl border border-red-400/30 bg-red-500/10 px-3 py-2 text-sm text-red-300" role="alert">
-          {sheetError}
-        </p>
-      )}
-      <button onClick={() => submitMoney(kind)} disabled={sheetBusy} className={`${kind === 'deposit' ? BTN_GOLD : BTN_PRIMARY} flex w-full items-center justify-center gap-2 py-3.5`}>
-        {sheetBusy && <Spinner />}
-        {kind === 'deposit'
-          ? depositMethod === 'card'
-            ? sheetBusy
-              ? 'Opening secure page…'
-              : 'Continue to secure payment'
-            : sheetBusy
-            ? 'Starting deposit…'
-            : 'Deposit now'
-          : sheetBusy
-          ? 'Sending request…'
-          : 'Request withdrawal'}
-      </button>
-      {kind === 'deposit' && depositMethod === 'mobile_money' && <p className="mt-3 text-center text-[11px] text-white/40">You’ll get a prompt on your phone. Approve it with your Mobile Money PIN.</p>}
-    </Sheet>
-  );
 
   // ─── HOME ───
-  const renderHome = () => {
-    const inProgress = activeJob?.status === 'in_progress';
-    const svc = activeJob ? SERVICE_META[normalizeService(activeJob.service_type)] : null;
-    const target = activeJob && jobGeo ? (inProgress ? jobGeo.dest : jobGeo.pickup) : null;
-    const targetAddress = activeJob ? (inProgress ? activeJob.destination : activeJob.pickup) : '';
-    const statusTitle = inProgress ? 'Trip in progress' : activeJob?.status === 'arrived' ? 'At pickup' : 'On the way';
-    const statusSub = inProgress ? 'Heading to destination' : activeJob?.status === 'arrived' ? 'Waiting for your customer' : 'Heading to pickup';
+  const homeTab = () => (
+    <div className="space-y-4">
+      {syncRow()}
+      <ServiceToggle k={K} services={DEFAULT_SERVICES} current={svc} onChange={s => changeService(s.id, s.name)} />
+      {svc !== 'ride' && walletBal < MIN_DEPOSIT && (
+        <button onClick={() => setWalletOpen(true)} className={`w-full rounded-2xl bg-amber-100 p-3 text-left text-sm font-bold text-amber-900 ${PRESS}`}>⚠️ Minimum deposit: {MIN_DEPOSIT} GHS (Cedis) is required to receive delivery jobs. Tap to top up.</button>
+      )}
+      {onBreak && (
+        <div className="flex items-center gap-3 rounded-2xl bg-amber-100 p-3 text-sm font-semibold text-amber-900" role="status">
+          <span>☕ You’re on a break. Job offers are paused.</span>
+          <button onClick={() => toggleBreak(false)} className="min-h-[44px] shrink-0 rounded-full bg-amber-900 px-4 text-xs font-bold text-white">End break</button>
+        </div>
+      )}
+      {checkin && (
+        <section className="rounded-3xl border-2 border-sky-400 bg-sky-50 p-4 text-sky-900" role="alert">
+          <p className="font-extrabold">Still on a trip? Confirm you’re safe 🛡️</p>
+          <div className="mt-3 flex gap-3">
+            <button onClick={() => { setCheckin(false); notify('Thanks. Ride safe.', 'ok'); }} className="min-h-[44px] flex-1 rounded-full bg-sky-600 text-sm font-bold text-white">I’m safe</button>
+            <button onClick={() => { setCheckin(false); setSafetyOpen(true); }} className="min-h-[44px] flex-1 rounded-full bg-red-600 text-sm font-bold text-white">I need help</button>
+          </div>
+        </section>
+      )}
 
-    return (
-      <>
-        {header('RYDNOW')}
-        <div className="space-y-4 px-4">
-          {/* Rider identity */}
-          <section className={`${CARD} p-4`}>
-            <div className="flex items-center gap-3">
-              <div className="flex h-14 w-14 shrink-0 items-center justify-center overflow-hidden rounded-full border-2 border-[#4AA3FF]/60 bg-white/10 text-lg font-bold">
-                {profile.photo_url ? (
-                  <Image src={profile.photo_url} alt="" width={56} height={56} unoptimized className="h-14 w-14 object-cover" />
-                ) : (
-                  profile.name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase() || <Icon name="user" />
-                )}
+      {guideOpen ? (
+        <section className="rounded-3xl bg-[#0A2342] p-5 text-white shadow-[0_10px_30px_rgba(10,35,66,0.35)]">
+          <h2 className="text-lg font-extrabold">Know before you go 👋</h2>
+          <ul className="mt-3 space-y-3">
+            {GUIDELINES.map(([icon, title, body]) => (
+              <li key={title} className="flex gap-3"><span className="text-xl" aria-hidden="true">{icon}</span><p className="text-sm leading-snug text-white/80"><b className="text-white">{title}.</b> {body}</p></li>
+            ))}
+          </ul>
+          <button onClick={dismissGuide} className={`mt-4 w-full ${gold}`}>I’ve read — Got it</button>
+        </section>
+      ) : (
+        <button onClick={() => setGuideOpen(true)} className={`flex ${TAP} w-full items-center justify-between rounded-2xl px-4 text-left text-sm font-semibold ${K.card} ${K.ink} ${PRESS}`}><span>{L('book', 'Rider guidelines')}</span><span className={`text-xs ${K.faint}`}>Show</span></button>
+      )}
+
+      {/* Map placeholder. BACKEND: swap this block for your Leaflet <LiveMap /> (hot zones = heat circles, pickups = 📍, destination = 🔴) */}
+      <section className={`relative h-56 overflow-hidden rounded-3xl ring-1 ring-black/10 ${K.map}`}>
+        <svg viewBox="0 0 400 224" className="absolute inset-0 h-full w-full" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+          <g stroke={K.road} strokeWidth="10" fill="none" strokeLinecap="round">
+            <path d="M-10 150 C100 120 160 190 260 120 S380 60 420 90" /><path d="M80 -10 C110 60 90 140 140 240" /><path d="M300 -10 C280 70 330 150 310 240" />
+          </g>
+          {online && !onBreak && (<><circle cx="110" cy="100" r="34" fill="#F9D342" fillOpacity="0.45" /><circle cx="300" cy="150" r="26" fill="#F9D342" fillOpacity="0.4" /></>)}
+          {online && !onBreak && !job && (<><text x="104" y="106" fontSize="18">📍</text><text x="294" y="156" fontSize="18">📍</text></>)}
+          {showDone && (<><text x="60" y="190" fontSize="16" opacity="0.6">✔️</text><text x="340" y="70" fontSize="16" opacity="0.6">✔️</text></>)}
+          {job && <path d="M200 120 C230 90 270 100 320 60" stroke={K.stroke} strokeWidth="4" strokeDasharray="2 8" strokeLinecap="round" fill="none" />}
+          {job && <circle cx="320" cy="60" r="8" fill="#EF4444" stroke="#fff" strokeWidth="3" />}
+        </svg>
+        <span className="absolute left-[48%] top-[48%] flex h-5 w-5">
+          {online && <span className="absolute h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />}
+          <span className={`relative h-5 w-5 rounded-full border-4 border-white shadow ${online ? 'bg-emerald-500' : 'bg-slate-400'}`} />
+        </span>
+        <div className="absolute right-2 top-2 flex flex-col gap-2">
+          <button onClick={refresh} aria-label="Refresh map" className="flex h-11 w-11 items-center justify-center rounded-full bg-white/95 text-lg shadow">{refreshing ? <Spinner cls="h-4 w-4" /> : <Icon name="refresh" className="h-4 w-4" />}</button>
+          <button onClick={() => setShowDone(s => !s)} aria-pressed={showDone} aria-label="Show completed jobs" className={`flex h-11 w-11 items-center justify-center rounded-full text-lg shadow ${showDone ? 'bg-[#F9D342]' : 'bg-white/95'}`}><Icon name="check" className="h-5 w-5 text-[#0A2342]" /></button>
+        </div>
+        <div className="absolute left-3 top-3 rounded-full bg-white/95 px-3 py-1 text-[11px] font-semibold text-[#0A2342] shadow"><span className="mr-1 inline-block h-2 w-2 rounded-full bg-emerald-500" />You <span className="mx-1 inline-block h-2 w-2 rounded-full bg-[#F9D342]" />Jobs <span className="mx-1 inline-block h-2 w-2 rounded-full bg-red-500" />Destination</div>
+        {online && !job && <div className="absolute inset-x-3 bottom-3 rounded-2xl bg-white/95 px-3 py-2 text-xs font-semibold text-[#0A2342] shadow">🔥 High demand: {HOT_ZONES.join(' · ')}</div>}
+      </section>
+
+      {/* Offer / active job / empty */}
+      {offer && (
+        <section className="rounded-3xl border-2 border-[#F9D342] p-4 shadow-[0_10px_30px_rgba(249,211,66,0.35)]" role="alertdialog" aria-label="New job request" style={{ background: dark ? '#0E2240' : '#fff' }}>
+          <div className="flex items-start justify-between">
+            <div><p className="text-xs font-bold text-amber-500">NEW REQUEST · {offer.km} km</p><p className={`mt-1 text-sm font-bold ${K.ink}`}>{offer.from} → {offer.to}</p></div>
+            <p className={`text-2xl font-black ${K.ink}`}>GH₵ {money(offer.fare)}</p>
+          </div>
+          <div className="mt-3 flex gap-3">
+            <button onClick={() => { setOffer(null); notify('Request declined.', 'info'); }} className={`flex-1 ${ghost}`}>Decline</button>
+            <button onClick={acceptOffer} className={`flex-[2] ${primary}`}>Accept</button>
+          </div>
+        </section>
+      )}
+      {job ? (
+        <section className={card('space-y-4')}>
+          <div className="flex items-center justify-between">
+            <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-bold text-emerald-700">{job.stage === 'pickup' ? 'Heading to pickup' : job.stage === 'arrived' ? 'At pickup' : 'Trip in progress'}</span>
+            <p className={`text-2xl font-black ${K.ink}`}>GH₵ {money(job.fare)}</p>
+          </div>
+          <div className={`space-y-2 text-sm font-semibold ${K.ink}`}><p>🔵 {job.from}</p><p>🟡 {job.to}</p><p className={`text-xs font-medium ${K.faint}`}>{job.customer} · {job.method === 'cash' ? 'Collect cash' : 'Paid online'}</p></div>
+          <div className="flex gap-3">
+            <a href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(`${job.stage === 'trip' ? job.to : job.from}, Accra, Ghana`)}&travelmode=driving`} target="_blank" rel="noopener noreferrer" className={`flex flex-1 items-center justify-center ${ghost}`}>{L('navigation', 'Navigate')}</a>
+            <button onClick={advance} className={`${TAP} flex-[2] rounded-full text-sm font-extrabold ${PRESS} ${job.stage === 'trip' ? 'bg-emerald-500 text-white' : 'bg-[#F9D342] text-[#0A2342]'}`}>{job.stage === 'pickup' ? 'I’ve arrived' : job.stage === 'arrived' ? 'Start trip' : 'Complete trip'}</button>
+          </div>
+          <div className="flex gap-3">
+            <button onClick={() => setChatOpen(true)} className={`flex-1 ${ghost}`}>{L('chat', 'Chat with customer')}</button>
+            <button onClick={() => window.open(`https://wa.me/?text=${encodeURIComponent(tripMsg)}`, '_blank', 'noopener')} className={`flex-1 ${ghost}`}>{L('pin', 'Share my trip')}</button>
+          </div>
+        </section>
+      ) : !offer && (
+        <section className={`${card()} py-8 text-center`}>
+          <span className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-[#F9D342]/25"><Icon name={onBreak ? 'clock' : online ? 'pin' : 'bike'} className="h-7 w-7" /></span>
+          <p className={`mt-2 font-extrabold ${K.ink}`}>{onBreak ? 'On a break' : online ? 'You’re online and ready' : 'You’re offline'}</p>
+          <p className={`mt-1 text-sm ${K.sub}`}>{onBreak ? 'Switch off break mode in Account → Schedule to get offers.' : online ? `Waiting for ${svcName} jobs near you…` : 'Tap Go Online below to start earning.'}</p>
+          {/* Demo helper. BACKEND: delete this; offers will arrive from polling /list-bookings/ */}
+          {online && !onBreak && <button onClick={() => { setOffer(MOCK_OFFER); pushNote('jobs', '🛵', 'New job alert', `${MOCK_OFFER.from} → ${MOCK_OFFER.to}`); }} className={`mt-4 ${TAP} rounded-full border border-dashed ${K.line} px-4 text-xs font-semibold ${K.sub}`}>Simulate a job request</button>}
+        </section>
+      )}
+
+      {/* Daily goal */}
+      {gate('h-28', (
+        <section className={`${card()} flex items-center gap-4`}>
+          <GoalRing pct={goalPct} k={K} />
+          <div className="min-w-0 flex-1">
+            <p className={`text-xs font-semibold ${K.faint}`}>Today’s earnings</p>
+            <p className={`text-3xl font-black tracking-tight ${K.ink}`}>GH₵ {money(todayEarned)}</p>
+            <p className={`text-xs ${K.sub}`}>{todayJobs.length} trips · goal GH₵ {goal}</p>
+            <button onClick={() => { setGoalInput(String(goal)); setGoalOpen(true); }} className={`${TAP} -ml-1 px-1 text-xs font-bold underline decoration-[#F9D342] decoration-2 underline-offset-4 ${K.ink}`}>Edit goal</button>
+          </div>
+          <div className="text-right"><p className={`text-[11px] ${K.faint}`}>Shift</p><p className={`text-sm font-extrabold ${K.ink}`}>{online ? fmtHM(shiftMs) : '—'}</p></div>
+        </section>
+      ))}
+
+      {/* Milestones, streak, peak hours */}
+      {gate('h-72', (
+        <section className={card('space-y-3')}>
+          <div className="flex items-center justify-between"><h2 className={`font-extrabold ${K.ink}`}>Goals & milestones</h2><span className="rounded-full bg-orange-100 px-3 py-1 text-xs font-bold text-orange-700">🔥 {rider.streakDays}-day streak</span></div>
+          <p className={`text-xs ${K.sub}`}>Keep it up! Ride tomorrow to make it {rider.streakDays + 1} days.</p>
+          {milestones.map(m => {
+            const pct = Math.min(100, Math.round((m.cur / m.target) * 100));
+            return (
+              <div key={m.id} className={`rounded-2xl p-3 ${K.soft}`}>
+                <div className="flex items-center justify-between gap-2"><p className={`text-sm font-bold ${K.ink}`}>{m.title}</p><span className="shrink-0 rounded-full bg-[#F9D342] px-2 py-0.5 text-[11px] font-extrabold text-[#0A2342]">+GH₵ {m.reward}</span></div>
+                <div className={`mt-2 h-2.5 overflow-hidden rounded-full ${dark ? 'bg-white/15' : 'bg-[#0A2342]/10'}`} role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100} aria-label={m.title}><div className="h-full rounded-full bg-[#F9D342] transition-all" style={{ width: `${pct}%` }} /></div>
+                <div className={`mt-1 flex justify-between text-[11px] ${K.faint}`}><span>{m.fmt(m.cur)} / {m.fmt(m.target)}</span><span>⏳ {leftTxt}</span></div>
               </div>
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-base font-bold">{profile.name}</p>
-                <p className="truncate text-xs text-white/50">
-                  {profile.rider_id ? `Rider ID RYD-${String(profile.rider_id).padStart(4, '0')}` : ''}
-                  {profile.phone ? ` · ${profile.phone}` : ''}
-                </p>
-                <div className="mt-1 flex items-center gap-2">
-                  <Stars value={profile.rating} size="h-3.5 w-3.5" />
-                  <span className="text-xs font-bold text-[#FFC83D]">{profile.rating ? profile.rating.toFixed(1) : 'New'}</span>
-                </div>
-              </div>
-              <span className={`shrink-0 rounded-full px-3 py-1 text-[11px] font-bold ${statusBadge.cls}`}>{statusBadge.text}</span>
+            );
+          })}
+          <div className="rounded-2xl bg-amber-100 p-3 text-sm font-semibold text-amber-900">
+            {inPeak ? `🚀 Peak hours now: +${PEAK.boost}% fares until ${h12(PEAK.to)}.` : `⏰ ${h12(PEAK.from)}–${h12(PEAK.to)} = +${PEAK.boost}% fares. ${hour < PEAK.from ? `Starts in ${fmtHM(minsToPeak * 60000)}, plan your shift around it.` : 'Plan tomorrow’s shift around it.'}`}
+          </div>
+        </section>
+      ))}
+
+      {/* Shift analytics */}
+      {gate('h-80', (
+        <section className={card('space-y-3')}>
+          <h2 className={`font-extrabold ${K.ink}`}>Shift analytics</h2>
+          <div>
+            <p className={`mb-1 text-xs ${K.sub}`}>Best times · busiest: 7–9 AM, 5–8 PM</p>
+            <div className="flex h-20 items-end gap-1" role="img" aria-label="Demand by hour, 6 AM to 10 PM. Peaks at 7 to 9 AM and 5 to 8 PM.">
+              {DEMAND.map((v, i) => <div key={i} className={`flex-1 rounded-t ${v >= 80 ? 'bg-[#F9D342]' : K.bar}`} style={{ height: `${v}%` }} />)}
             </div>
-            {approvedServices.length > 0 && (
-              <div className="mt-3 flex flex-wrap gap-2">
-                {approvedServices.map(s => (
-                  <span key={s.key} className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 py-1 pl-1.5 pr-3 text-[11px] font-semibold text-white/80">
-                    <Image src={SERVICE_META[s.key].icon} alt="" width={18} height={18} className="h-[18px] w-[18px] object-contain" />
-                    {SERVICE_META[s.key].label}
-                  </span>
+            <div className={`mt-1 flex justify-between text-[10px] ${K.faint}`}><span>6 AM</span><span>2 PM</span><span>10 PM</span></div>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-center">
+            {[
+              [`GH₵ ${money(ANALYTICS.perHr)}/hr`, `Your average · platform GH₵ ${money(ANALYTICS.platformPerHr)} (+${Math.round((ANALYTICS.perHr / ANALYTICS.platformPerHr - 1) * 100)}%)`],
+              [`${ANALYTICS.km} km`, 'Distance this week'],
+              [`${ANALYTICS.onlineHrs} h`, 'Online hours this week'],
+              [`${Math.round((ANALYTICS.earningHrs / ANALYTICS.onlineHrs) * 100)}%`, `Efficiency · ${ANALYTICS.earningHrs} earning of ${ANALYTICS.onlineHrs} online hrs`],
+            ].map(([v, l]) => <div key={l} className={`rounded-2xl p-3 ${K.soft}`}><p className={`text-base font-black ${K.ink}`}>{v}</p><p className={`text-[11px] ${K.sub}`}>{l}</p></div>)}
+          </div>
+        </section>
+      ))}
+
+      {/* Weather & demand forecast */}
+      <section className={`rounded-3xl ${K.card}`}>
+        <button onClick={() => setWeatherOpen(o => !o)} aria-expanded={weatherOpen} className={`flex ${TAP} w-full items-center gap-3 p-4 text-left ${K.ink}`}>
+          <Icon name="sun" className="h-6 w-6" /><span className="flex-1 font-extrabold">{WEATHER.temp}°C · {WEATHER.cond}</span><span className={`transition-transform ${weatherOpen ? 'rotate-90' : ''} ${K.faint}`}>›</span>
+        </button>
+        {weatherOpen && (
+          <div className="space-y-2 px-4 pb-4 text-sm">
+            <p className="rounded-2xl bg-sky-100 p-3 font-semibold text-sky-900">🌧️ Rain expected {WEATHER.rainFrom}–{WEATHER.rainTo}. Demand likely higher.</p>
+            <p className={`rounded-2xl p-3 font-semibold ${K.soft} ${K.ink}`}>📈 Tomorrow’s busiest times: 7–9 AM, 5–8 PM</p>
+            <p className={`text-xs ${K.faint}`}>Heat zones show on the map while you’re online: {HOT_ZONES.join(', ')}.</p>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+
+  // ─── JOBS ───
+  const jobsTab = () => (
+    <div className="space-y-4">
+      {syncRow()}
+      <div className={`grid grid-cols-2 rounded-full p-1 ${K.soft}`} role="tablist">
+        {(['earnings', 'performance'] as const).map(v => (
+          <button key={v} role="tab" aria-selected={jobsView === v} onClick={() => setJobsView(v)} className={`${TAP} rounded-full text-sm font-bold transition ${jobsView === v ? `${K.btn} shadow` : K.sub}`}>{v === 'earnings' ? L('wallet', 'Earnings') : L('chart', 'Performance')}</button>
+        ))}
+      </div>
+
+      {jobsView === 'performance' ? (
+        gate('h-96', (
+          <>
+            <section className={card('text-center')}>
+              <p className={`text-5xl font-black ${K.ink}`}>{RATINGS.avg}<span className={`text-xl font-bold ${K.faint}`}>/5</span></p>
+              <div className="mt-1"><Stars v={RATINGS.avg} /></div>
+              <p className={`mt-1 text-xs ${K.sub}`}>{RATINGS.total} ratings</p>
+              <p className="mt-3 inline-block rounded-full bg-[#F9D342] px-4 py-1.5 text-xs font-extrabold text-[#0A2342]">🏅 Top 5% rider this week</p>
+              <p className={`mt-1 text-xs ${K.sub}`}>Consistently great service</p>
+            </section>
+            <section className={card('space-y-2')}>
+              <h2 className={`font-extrabold ${K.ink}`}>Rating breakdown</h2>
+              {RATINGS.dist.map((n, i) => (
+                <div key={i} className="flex items-center gap-2 text-xs">
+                  <span className={`w-6 font-bold ${K.ink}`}>{5 - i}★</span>
+                  <div className={`h-3 flex-1 overflow-hidden rounded-full ${K.soft}`}><div className="h-full rounded-full bg-[#F9D342]" style={{ width: `${(n / RATINGS.total) * 100}%` }} /></div>
+                  <span className={`w-8 text-right ${K.sub}`}>{n}</span>
+                </div>
+              ))}
+            </section>
+            <section className="grid grid-cols-3 gap-2 text-center">
+              {[['Acceptance', RATINGS.acceptance, RATINGS.dAcc, true], ['Response', RATINGS.response, RATINGS.dResp, true], ['Cancellation', RATINGS.cancel, RATINGS.dCancel, false]].map(([l, v, d, up]) => (
+                <div key={l as string} className={card('!p-3')}><p className={`text-xl font-black ${K.ink}`}>{v as number}%</p><p className={`text-[11px] ${K.sub}`}>{l as string}</p>{trend(d as number, up as boolean)}</div>
+              ))}
+              <p className={`col-span-3 text-[11px] ${K.faint}`}>Arrows compare with last week.</p>
+            </section>
+          </>
+        ))
+      ) : (
+        <>
+          <div className={`grid grid-cols-3 rounded-full p-1 ${K.soft}`} role="tablist" aria-label="Period">
+            {(['today', 'week', 'month'] as Period[]).map(p => (
+              <button key={p} role="tab" aria-selected={period === p} onClick={() => setPeriod(p)} className={`${TAP} rounded-full text-sm font-bold transition ${period === p ? `${K.btn} shadow` : K.sub}`}>{p === 'today' ? 'Today' : p === 'week' ? 'This week' : 'This month'}</button>
+            ))}
+          </div>
+          {gate('h-44', (
+            <section className={`rounded-3xl p-5 shadow-[0_10px_30px_rgba(10,35,66,0.3)] ${K.hero}`}>
+              <p className="text-xs text-white/70">Net earnings</p>
+              <p className="text-4xl font-black tracking-tight text-[#F9D342]">GH₵ {money(totals.net)}</p>
+              <div className="mt-4 grid grid-cols-4 gap-2 text-center text-[11px]">
+                {[['Base', totals.base], ['Fees', -totals.fee], ['Bonus', totals.bonus], ['Net', totals.net]].map(([l, v]) => <div key={l as string} className="rounded-2xl bg-white/10 p-2"><p className="text-white/70">{l as string}</p><p className="text-sm font-extrabold">{(v as number) < 0 ? '−' : ''}{money(Math.abs(v as number))}</p></div>)}
+              </div>
+            </section>
+          ))}
+          {gate('h-44', (
+            <section className={`${card()} flex items-center gap-4`}>
+              <Donut k={K} parts={[{ v: totals.cashNet, c: '#F9D342', l: 'Cash' }, { v: totals.onlineNet, c: '#3B82F6', l: 'Online' }, { v: totals.fee, c: '#EF4444', l: 'Fees' }]} />
+              <ul className={`flex-1 space-y-2 text-sm ${K.ink}`}>
+                {[['#F9D342', 'Cash', totals.cashNet], ['#3B82F6', 'Online', totals.onlineNet], ['#EF4444', 'Fees deducted', totals.fee]].map(([c, l, v]) => (
+                  <li key={l as string} className="flex items-center justify-between gap-2"><span className="flex items-center gap-2"><span className="h-3 w-3 rounded-full" style={{ background: c as string }} />{l as string}</span><b>GH₵ {money(v as number)}</b></li>
                 ))}
+              </ul>
+            </section>
+          ))}
+          {gate('h-28', (
+            <section className={card('flex items-center gap-3')}>
+              <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#F9D342]/30"><Icon name="bank" className="h-6 w-6" /></span>
+              <div className="min-w-0 flex-1">
+                <p className={`text-xs font-semibold ${K.faint}`}>Next payout · {fmtDate(nextFriday())}</p>
+                <p className={`text-xl font-black ${K.ink}`}>≈ GH₵ {money(weekJobs.filter(j => j.method === 'online').reduce((s, j) => s + netOf(j), 0))}</p>
+                <p className={`text-xs ${K.sub}`}>MTN MoMo •••• {rider.phone.slice(-4)}</p>
               </div>
-            )}
-          </section>
-
-          {/* Map */}
-          <section className="relative overflow-hidden rounded-3xl border border-white/10 shadow-[0_20px_60px_rgba(0,0,0,0.45)]">
-            <LiveMap
-              rider={currentLocation}
-              pickup={jobGeo?.pickup}
-              destination={jobGeo && jobGeo.dest && jobGeo.dest !== jobGeo.pickup ? jobGeo.dest : null}
-              routeCoords={tripRoute?.coords}
-              height={activeJob ? 250 : 230}
-              follow
-            />
-            <button
-              onClick={() => setActiveTab('alerts')}
-              aria-label={`Notifications${unread ? `, ${unread} unread` : ''}`}
-              className="absolute right-3 top-3 z-[500] flex h-11 w-11 items-center justify-center rounded-full border border-white/15 bg-[#0A1530]/85 text-white backdrop-blur"
-            >
-              <Icon name="bell" />
-              {unread > 0 && (
-                <span className="absolute -right-1 -top-1 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold">{unread > 9 ? '9+' : unread}</span>
-              )}
-            </button>
-            <button
-              onClick={locationStatus === 'granted' ? undefined : requestLocation}
-              className="absolute left-3 top-3 z-[500] flex items-center gap-2 rounded-full border border-white/15 bg-[#0A1530]/85 px-3 py-2 text-xs font-semibold backdrop-blur"
-            >
-              <span aria-hidden="true">{locationLabel.icon}</span>
-              {locationLabel.text}
-            </button>
-            {!activeJob && (
-              <div className="absolute inset-x-3 bottom-3 z-[500] flex items-center justify-between rounded-2xl border border-white/10 bg-[#0A1530]/85 px-4 py-3 backdrop-blur">
-                <div className="flex items-center gap-2">
-                  <span className="relative flex h-2.5 w-2.5">
-                    {isOnline && <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />}
-                    <span className={`relative inline-flex h-2.5 w-2.5 rounded-full ${isOnline ? 'bg-emerald-400' : 'bg-white/30'}`} />
-                  </span>
-                  <p className="text-sm font-bold">{isOnline ? 'Looking for requests…' : 'You’re offline'}</p>
-                </div>
-                {isOnline && availableJobs.length > 0 && <span className="rounded-full bg-[#F5B82E] px-2.5 py-0.5 text-xs font-bold text-[#2A1B00]">{availableJobs.length} waiting</span>}
+            </section>
+          ))}
+          {gate('h-40', (
+            <section className={card()}>
+              <p className={`mb-3 text-sm font-bold ${K.ink}`}>Last 7 days</p>
+              <div className="flex h-24 items-end gap-2" role="img" aria-label="Daily net earnings for the last 7 days">
+                {weekBars.map((b, i) => <div key={i} className="flex h-full flex-1 flex-col items-center justify-end gap-1"><div className={`w-full rounded-t-lg ${i === 6 ? 'bg-[#F9D342]' : K.bar}`} style={{ height: `${Math.max(4, (b.v / maxBar) * 100)}%` }} /><span className={`text-[10px] font-semibold ${K.faint}`}>{b.label}</span></div>)}
               </div>
-            )}
-          </section>
-
-          {locStale && (
-            <div className="rounded-2xl border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-200" role="alert">
-              Can’t access your location — check your settings.
-            </div>
-          )}
-          {error && (
-            <div className="rounded-2xl border border-red-400/30 bg-red-500/10 p-3 text-sm text-red-200" role="alert">
-              {error}
-            </div>
-          )}
-
-          {/* Active trip */}
-          {activeJob && svc && (
-            <>
-              <section className="relative overflow-hidden rounded-3xl border border-white/15 bg-gradient-to-br from-[#2F7BFF] via-[#1A4FD6] to-[#0B2A8F] p-5 shadow-[0_20px_60px_rgba(31,107,255,0.45)]">
-                <Image src={svc.icon} alt="" width={180} height={180} className="pointer-events-none absolute -bottom-4 -right-4 h-44 w-44 object-contain opacity-95 drop-shadow-[0_10px_30px_rgba(0,0,0,0.4)]" />
-                <span className="mb-3 block h-1 w-10 rounded-full bg-[#7CC2FF]" />
-                <h2 className={`${DISPLAY} text-3xl font-bold leading-tight tracking-tight`}>{statusTitle}</h2>
-                <p className="mt-1 text-lg font-semibold text-[#A8D6FF]">{activeJob.customer_name || 'Customer'}</p>
-                <p className="mt-1 text-sm text-white/80">{statusSub}</p>
-                <div className="mt-5 flex items-end justify-between pr-2">
-                  <div>
-                    <p className="text-[11px] text-white/70">Estimated fare</p>
-                    <p className={`${DISPLAY} text-2xl font-bold tracking-tight`}>GH₵ {money(fareOf(activeJob))}</p>
-                  </div>
-                  <p className="rounded-full bg-black/25 px-3 py-1.5 text-sm font-bold">
-                    {tripRoute ? `ETA ${tripRoute.min} min` : 'ETA —'}
-                    {tripRoute ? ` · ${tripRoute.km} km` : ''}
-                  </p>
-                </div>
-              </section>
-
-              <section className={`${CARD} space-y-4 p-4`}>
-                {routeLine(activeJob.pickup, activeJob.destination)}
-                {(activeJob.parcel_details || activeJob.delivery_category) && (
-                  <p className="rounded-xl bg-white/5 px-3 py-2 text-xs text-white/70">
-                    {activeJob.delivery_category ? `${activeJob.delivery_category}: ` : ''}
-                    {activeJob.parcel_details}
-                  </p>
-                )}
-                {(activeJob.customer_name || activeJob.customer_phone) && (
-                  <div className="flex items-center gap-3 rounded-2xl bg-white/5 p-3">
-                    <span className="flex h-10 w-10 items-center justify-center rounded-full bg-[#1F6BFF] text-white">
-                      <Icon name="user" />
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-bold">{activeJob.customer_name || 'Customer'}</p>
-                      <p className="truncate text-xs text-white/50">{activeJob.customer_phone || 'No phone on file'}</p>
-                    </div>
-                    {activeJob.customer_phone && (
-                      <>
-                        <a href={`tel:${activeJob.customer_phone}`} aria-label="Call customer" className="flex h-10 w-10 items-center justify-center rounded-full border border-white/15 bg-white/5 text-[#6DB7FF]">
-                          <Icon name="phone" />
-                        </a>
-                        <a href={whatsappLink(activeJob.customer_phone)} target="_blank" rel="noopener noreferrer" aria-label="WhatsApp customer" className="flex h-10 w-10 items-center justify-center rounded-full border border-white/15 bg-white/5 text-emerald-400">
-                          <Icon name="chat" />
-                        </a>
-                      </>
-                    )}
-                  </div>
-                )}
-                <div className="flex items-center justify-between border-t border-white/10 pt-3">
-                  <p className="text-xs text-white/50">After service fee</p>
-                  <p className="rounded-full bg-emerald-500/15 px-3 py-1 text-sm font-bold text-emerald-300">You earn ~GH₵ {money(earnOf(activeJob))}</p>
-                </div>
-                <div className="flex gap-3">
-                  <a href={googleNav(target, targetAddress)} target="_blank" rel="noopener noreferrer" className={`${BTN_GHOST} flex flex-1 items-center justify-center gap-2 py-3 text-sm`}>
-                    <Icon name="navigate" className="h-4 w-4" />
-                    Navigate to {inProgress ? 'destination' : 'pickup'}
-                  </a>
-                  {target && (
-                    <a href={wazeNav(target)} target="_blank" rel="noopener noreferrer" className={`${BTN_GHOST} px-5 py-3 text-sm`}>
-                      Waze
-                    </a>
-                  )}
-                </div>
-              </section>
-            </>
-          )}
-
-          {/* Earnings pill */}
-          <button onClick={() => setActiveTab('wallet')} className="flex w-full items-center gap-3 rounded-full border border-[#4AA3FF]/40 bg-[#0E1E4A]/70 p-2 pr-5 text-left shadow-[0_0_30px_rgba(31,107,255,0.25)]">
-            <span className="flex h-11 w-11 items-center justify-center rounded-full border border-[#4AA3FF]/50 text-[#6DB7FF]">
-              <Icon name="wallet" />
-            </span>
-            <span className="flex-1">
-              <span className={`${DISPLAY} block text-xl font-bold tracking-tight`}>Today GH₵ {money(todayStats.earned)}</span>
-              <span className="block text-[11px] text-white/50">
-                {todayStats.trips} {todayStats.trips === 1 ? 'trip' : 'trips'} · {goalPct >= 100 ? 'Goal reached 🎉' : `${goalPct}% of GH₵ ${dailyGoal} goal`}
-              </span>
-            </span>
-            <span className="flex items-center gap-1 text-sm font-semibold text-[#6DB7FF]">
-              Details <Icon name="chevron" className="h-4 w-4" />
-            </span>
-          </button>
-
-          {restrictedCard()}
-          {!activeJob && !blocked && gateBanner()}
-
-          {/* Service switching (only when approved for more than one) */}
-          {approvedServices.length > 1 && (
-            <section>
-              <h3 className="mb-2 text-sm font-bold">Working on</h3>
-              <div className="-mx-4 flex gap-2 overflow-x-auto px-4 pb-1">
-                {approvedServices.map(s => {
-                  const meta = SERVICE_META[s.key];
-                  return (
-                    <button
-                      key={s.key}
-                      onClick={() => toggleService(s.key)}
-                      aria-pressed={s.active}
-                      className={`flex shrink-0 items-center gap-2 rounded-full border-2 py-1.5 pl-2 pr-4 ${s.active ? CHIP_ON : CHIP_OFF}`}
-                    >
-                      <Image src={meta.icon} alt="" width={28} height={28} className="h-7 w-7 object-contain" />
-                      <span className="text-left">
-                        <span className="block text-xs font-bold">{meta.label}</span>
-                        <span className="block text-[10px] text-white/50">{s.active ? 'On' : 'Off'}</span>
-                      </span>
+            </section>
+          ))}
+          <div className="-mx-4 flex gap-2 overflow-x-auto px-4" role="tablist" aria-label="Transaction filter">
+            {(['all', 'cash', 'online', 'bonus', 'fee'] as TxFilter[]).map(f => <button key={f} role="tab" aria-selected={txFilter === f} onClick={() => setTxFilter(f)} className={chip(txFilter === f)}>{f === 'all' ? 'All' : f[0].toUpperCase() + f.slice(1)}</button>)}
+          </div>
+          {gate('h-48', listJobs.length === 0 ? empty('bike', 'No trips here yet', 'Go online to start earning.') : (
+            <ul className="space-y-2">
+              {listJobs.map(j => {
+                const open = openTx === j.id;
+                const val = txFilter === 'fee' ? -j.fee : txFilter === 'bonus' ? j.bonus : netOf(j);
+                return (
+                  <li key={j.id} className={`rounded-2xl ${K.card}`}>
+                    <button onClick={() => setOpenTx(open ? null : j.id)} aria-expanded={open} className={`flex ${TAP} w-full items-center gap-3 p-3 text-left`}>
+                      <span className="flex h-10 w-10 items-center justify-center rounded-full bg-[#F9D342]/30 text-lg" aria-hidden="true"><Icon name={j.method === 'cash' ? 'cash' : 'mobile'} className="h-5 w-5" /></span>
+                      <span className="min-w-0 flex-1"><span className={`block truncate text-sm font-bold ${K.ink}`}>{j.from} → {j.to}{j.proof ? ' 📎' : ''}</span><span className={`block text-xs ${K.faint}`}>{fmtDate(j.at)} · {j.km} km</span></span>
+                      <span className={`text-base font-black ${val < 0 ? 'text-red-500' : K.ink}`}>{val < 0 ? '−' : txFilter === 'bonus' ? '+' : ''}GH₵ {money(Math.abs(val))}</span>
                     </button>
-                  );
-                })}
-              </div>
-            </section>
-          )}
+                    {open && (
+                      <dl className={`mx-3 mb-3 space-y-1 border-t pt-2 text-sm ${K.line} ${K.ink}`}>
+                        {[['Base fare', `GH₵ ${money(j.base)}`], ['Service fee', `− GH₵ ${money(j.fee)}`], ['Bonus', `+ GH₵ ${money(j.bonus)}`]].map(([l, v]) => <div key={l} className="flex justify-between"><dt className={K.sub}>{l}</dt><dd>{v}</dd></div>)}
+                        <div className="flex justify-between font-extrabold"><dt>Net earnings</dt><dd>GH₵ {money(netOf(j))}</dd></div>
+                        {j.proof && (j.proof.startsWith('blob:') ? (
+                          <div className="pt-2"><dt className={`mb-1 ${K.sub}`}>📎 Proof of delivery</dt><dd><img src={j.proof} alt="Proof of delivery" className="max-h-40 rounded-xl object-cover" /></dd></div>
+                        ) : <div className="flex justify-between pt-1"><dt className={K.sub}>📎 Proof (scanned)</dt><dd>{j.proof.replace('code:', '')}</dd></div>)}
+                      </dl>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          ))}
+        </>
+      )}
+    </div>
+  );
 
-          {/* Nearby requests */}
-          {isOnline && !activeJob && availableJobs.length > 0 && (
-            <section className="space-y-3">
-              <h3 className="text-sm font-bold">Requests near you</h3>
-              {availableJobs.map(j => jobCard(j))}
-            </section>
-          )}
-
-          {/* Recent trips */}
-          <section>
-            <div className="mb-2 flex items-center justify-between">
-              <h3 className={`${DISPLAY} text-lg font-bold tracking-tight`}>Recent Trips</h3>
-              <button onClick={() => setActiveTab('trips')} className="text-xs font-bold text-[#6DB7FF]">
-                See all
-              </button>
-            </div>
-            {history.length === 0 ? (
-              <p className={`${CARD} p-5 text-center text-sm text-white/50`}>No trips yet. Go online to get your first request.</p>
-            ) : (
-              <div className="space-y-2">{history.slice(0, 4).map(j => tripRow(j))}</div>
-            )}
-          </section>
-        </div>
-      </>
-    );
-  };
-
-  // ─── TRIPS ───
-  const renderTrips = () => {
-    const from = periodStart(tripPeriod);
-    const q = tripQuery.trim().toLowerCase();
-    const list = history.filter(
-      j =>
-        new Date(j.created_at || 0).getTime() >= from &&
-        (tripService === 'all' || normalizeService(j.service_type) === tripService) &&
-        (!q || `${j.pickup} ${j.destination}`.toLowerCase().includes(q))
-    );
-    const done = history.filter(j => j.status === 'completed').length;
-    const cancelled = history.filter(j => j.status === 'cancelled').length;
-    const completionRate = profile.completion_rate ?? (done + cancelled > 0 ? Math.round((done / (done + cancelled)) * 100) : undefined);
-    const stats: [string, string][] = [
-      ['Rating', profile.rating ? `${profile.rating.toFixed(1)} / ${MAX_RATING}` : '—'],
-      ['Trips completed', String(Math.max(profile.completed_jobs, done))],
-      ['Acceptance', profile.acceptance_rate != null ? `${Math.round(profile.acceptance_rate)}%` : '—'],
-      ['Completion', completionRate != null ? `${Math.round(completionRate)}%` : '—'],
-    ];
+  // ─── ACCOUNT ───
+  const accountTab = () => {
+    const hq = helpQ.trim().toLowerCase();
+    const faqs = HELP.filter(f => (!helpCat || f.cat === helpCat) && (!hq || `${f.q} ${f.a}`.toLowerCase().includes(hq)));
     return (
-      <>
-        {header('Trips')}
-        <div className="space-y-4 px-4">
-          <section className="grid grid-cols-2 gap-3">
-            {stats.map(([label, value]) => (
-              <div key={label} className={`${CARD} p-4`}>
-                <p className={`${DISPLAY} text-xl font-bold tracking-tight`}>{value}</p>
-                <p className="text-xs text-white/50">{label}</p>
+      <div className="space-y-3">
+        {syncRow()}
+        <section className={`${card()} flex items-center gap-4`}>
+          {photoUrl ? <img src={photoUrl} alt="Your profile photo" className="h-16 w-16 shrink-0 rounded-full object-cover" /> : <span className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full bg-[#F9D342] text-2xl font-black text-[#0A2342]">{initials}</span>}
+          <div className="min-w-0 flex-1">
+            <p className={`truncate text-lg font-extrabold ${K.ink}`}>{rider.name}</p>
+            <p className={`truncate text-sm ${K.sub}`}>{rider.phone}</p>
+            <p className={`truncate text-xs ${K.faint}`}>{rider.email}</p>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-bold ${BADGE[docState].cls}`}><Icon name={BADGE[docState].icon} className="h-3 w-3" />{BADGE[docState].label}</span>
+              <span className={`inline-flex items-center gap-1 text-xs font-bold ${K.ink}`}><Icon name="star" className="h-3.5 w-3.5 text-[#F9D342]" />{RATINGS.avg}</span>
+              <span className="inline-flex items-center gap-1 text-xs font-bold text-orange-600"><Icon name="flame" className="h-3.5 w-3.5" />{rider.streakDays}-day streak</span>
+            </div>
+          </div>
+        </section>
+        <button onClick={() => setWalletOpen(true)} className={`flex ${TAP} w-full items-center gap-3 rounded-3xl p-4 text-left ${K.card} ${K.ink} ${PRESS}`}>
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-[#F9D342] text-[#0A2342]"><Icon name="wallet" className="h-6 w-6" /></span>
+          <span className="min-w-0 flex-1"><span className="block font-extrabold">Wallet</span><span className={`block text-xs ${K.sub}`}>Deposit & withdraw · GH₵ {money(walletBal)}</span></span>
+          <Icon name="chevron" className={`h-5 w-5 ${K.faint}`} />
+        </button>
+
+        <Fold k={K} title="Profile photo" icon="camera" open>
+          <div className="flex items-center gap-3">
+            {photoUrl ? <img src={photoUrl} alt="Your profile photo" className="h-16 w-16 rounded-full object-cover" /> : <span className={`flex h-16 w-16 items-center justify-center rounded-full text-2xl ${K.soft}`}>🧑</span>}
+            <div className="min-w-0 flex-1"><p className={`text-sm font-bold ${K.ink}`}>{photoUrl ? 'Photo uploaded' : 'No photo yet'}</p>
+              <p className={`text-xs ${K.sub}`}>{photoStatus === 'verified' ? '✅ Verified' : photoStatus === 'pending' ? '⏳ Pending Verification' : 'Customers see your photo to verify you.'}</p></div>
+          </div>
+          <button onClick={() => setPhotoOpen(true)} className={`w-full ${gold}`}>{L('camera', 'Upload Your Photo')}</button>
+        </Fold>
+
+        <Fold k={K} title="Personal details" icon="user" open>
+          {field('Full name', 'name')}{field('Phone', 'phone', 'tel')}{field('Email', 'email', 'email')}
+          {editing ? (
+            <div className="flex gap-3">
+              <button onClick={() => setEditing(false)} disabled={saving} className={`flex-1 ${ghost}`}>Cancel</button>
+              <button onClick={saveProfile} disabled={saving} className={`flex flex-[2] items-center justify-center gap-2 disabled:opacity-60 ${primary}`}>{saving && <Spinner cls="h-4 w-4" />}Save changes</button>
+            </div>
+          ) : <button onClick={() => { setForm({ name: rider.name, phone: rider.phone, email: rider.email }); setEditing(true); }} className={ghost}>Edit details</button>}
+        </Fold>
+
+        <Fold k={K} title="Vehicles" icon="bike" open>
+          {vehicles.map(v => (
+            <div key={v.id} className={`rounded-2xl border p-3 ${K.line}`}>
+              <div className="flex items-start justify-between gap-2">
+                <div><p className={`text-sm font-extrabold ${K.ink}`}>{v.model}</p><p className={`text-xs ${K.sub}`}>{v.plate} · {v.color}</p></div>
+                <span className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${v.active ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-700'}`}>{v.active ? 'Active' : v.status === 'pending' ? 'Pending' : 'Inactive'}</span>
+              </div>
+              <p className={`mt-2 text-xs ${K.sub}`}>🔧 Next service due: {fmtFull(v.service)} or in {v.kmLeft} km</p>
+              {!v.active && <button onClick={() => setActiveVehicle(v.id)} className={`mt-2 w-full ${ghost}`}>Set as active</button>}
+            </div>
+          ))}
+          <button onClick={() => setAddVeh(true)} className={`w-full ${gold}`}>{L('plus', 'Add a vehicle')}</button>
+        </Fold>
+
+        <Fold k={K} title="Documents" icon="file" open>
+          <ul className={`divide-y ${K.divide}`}>
+            {MOCK_DOCS.map(d => (
+              <li key={d.name} className="flex items-center gap-3 py-3"><Icon name={BADGE[d.status].icon} className={`h-5 w-5 shrink-0 ${d.status === 'verified' ? 'text-emerald-500' : d.status === 'pending' ? 'text-amber-500' : 'text-red-500'}`} />
+                <div className="min-w-0 flex-1"><p className={`text-sm font-bold ${K.ink}`}>{d.name}</p><p className={`text-xs ${K.faint}`}>{d.note}</p></div>
+                <span className={`rounded-full px-2.5 py-1 text-[11px] font-bold ${BADGE[d.status].cls}`}>{BADGE[d.status].label}</span></li>
+            ))}
+          </ul>
+        </Fold>
+
+        <Fold k={K} title="Safety centre" icon="shield" open>
+          <button onClick={() => setSafetyOpen(true)} className={`w-full rounded-full bg-red-600 ${TAP} text-sm font-extrabold text-white ${PRESS}`}>{L('shield', 'Open safety centre')}</button>
+          <p className={`text-xs ${K.sub}`}>Emergency contact: {EMERGENCY.name} · {EMERGENCY.phone}. Emergency services: {EMERGENCY.national}.</p>
+        </Fold>
+
+        <Fold k={K} title="Schedule & availability" icon="calendar">
+          <p className={`rounded-2xl p-3 text-sm font-semibold ${K.soft} ${K.ink}`}>{summarize(sched)}</p>
+          <p className={`text-sm ${K.sub}`}>{sched[tomorrowIdx].on ? `🔔 You’re scheduled for tomorrow at ${h12(sched[tomorrowIdx].from).replace(/(AM|PM)/, ':00 $1')}. Ready to ride?` : '🔔 Nothing scheduled for tomorrow.'}</p>
+          <div className="flex items-center justify-between"><span className={`text-sm font-bold ${K.ink}`}>☕ I’m taking a break</span><Toggle k={K} on={onBreak} onChange={toggleBreak} label="Taking a break" /></div>
+          <div className={`divide-y ${K.divide}`}>
+            {sched.map((s, i) => (
+              <div key={i} className="flex items-center gap-2 py-1">
+                <span className={`w-9 text-sm font-bold ${K.ink}`}>{DAYS[i]}</span>
+                <Toggle k={K} on={s.on} onChange={v => updateSched(i, { on: v })} label={`Ride on ${DAYS[i]}`} />
+                {s.on ? (<>
+                  <select aria-label={`${DAYS[i]} start`} value={s.from} onChange={e => updateSched(i, { from: +e.target.value })} className={`${TAP} flex-1 rounded-xl border px-2 text-sm ${K.input}`}>{Array.from({ length: 24 }, (_, h) => <option key={h} value={h}>{h12(h)}</option>)}</select>
+                  <select aria-label={`${DAYS[i]} end`} value={s.to} onChange={e => updateSched(i, { to: +e.target.value })} className={`${TAP} flex-1 rounded-xl border px-2 text-sm ${K.input}`}>{Array.from({ length: 24 }, (_, h) => h + 1).map(h => <option key={h} value={h}>{h12(h)}</option>)}</select>
+                </>) : <span className={`text-xs ${K.faint}`}>Day off</span>}
               </div>
             ))}
-            <p className="col-span-2 -mt-1 text-center text-[11px] text-white/40">
-              Member since {profile.member_since ? new Date(profile.member_since).toLocaleDateString('en-GH', { month: 'long', year: 'numeric' }) : '—'}
-            </p>
-          </section>
-
-          <input value={tripQuery} onChange={e => setTripQuery(e.target.value)} placeholder="Search pickup or destination" aria-label="Search trips" className={INPUT} />
-          <div className="-mx-4 flex gap-2 overflow-x-auto px-4">
-            {(['all', 'today', 'week', 'month'] as Period[]).map(p => (
-              <button key={p} onClick={() => setTripPeriod(p)} className={`shrink-0 rounded-full border px-4 py-1.5 text-xs font-bold ${tripPeriod === p ? CHIP_ON : CHIP_OFF}`}>
-                {PERIOD_LABEL[p]}
-              </button>
-            ))}
           </div>
-          <div className="-mx-4 flex gap-2 overflow-x-auto px-4">
-            {(['all', ...ALL_SERVICE_KEYS] as ('all' | ServiceKey)[]).map(s => (
-              <button key={s} onClick={() => setTripService(s)} className={`shrink-0 rounded-full border px-4 py-1.5 text-xs font-bold ${tripService === s ? CHIP_ON : CHIP_OFF}`}>
-                {s === 'all' ? 'All services' : SERVICE_META[s].label}
-              </button>
-            ))}
-          </div>
-          <p className="text-xs text-white/50">
-            {list.length} {list.length === 1 ? 'trip' : 'trips'} · GH₵ {money(list.filter(j => j.status === 'completed').reduce((s, j) => s + earnOf(j), 0))} earned
-          </p>
-          {list.length === 0 ? (
-            <p className={`${CARD} p-6 text-center text-sm text-white/50`}>No trips match these filters.</p>
-          ) : (
-            <div className="space-y-2">{list.map(j => tripRow(j, true))}</div>
-          )}
-        </div>
-      </>
-    );
-  };
-
-  // ─── WALLET ───
-  const renderWallet = () => {
-    const from = txFilter === 'today' ? startOfToday() : txFilter === 'week' ? Date.now() - 7 * 86400000 : 0;
-    const txs = transactions.filter(tx => new Date(tx.created_at).getTime() >= from);
-    return (
-      <>
-        {header('Wallet')}
-        <div className="space-y-4 px-4">
-          {walletFailed && (
-            <div className="flex items-center gap-3 rounded-2xl border border-amber-400/30 bg-amber-400/10 p-3 text-sm text-amber-200" role="alert">
-              <span className="flex-1">Couldn’t refresh your wallet. The balance below may be out of date.</span>
-              <button onClick={fetchWallet} className="text-xs font-bold underline">
-                Retry
-              </button>
-            </div>
-          )}
-          {depositWaitingUntil > 0 && (
-            <div className="flex items-center gap-3 rounded-2xl border border-[#4AA3FF]/30 bg-[#1F6BFF]/10 p-3 text-sm text-[#9FD0FF]">
-              <Spinner /> Waiting for your payment to confirm…
-            </div>
-          )}
-          <section className="rounded-3xl border border-white/15 bg-gradient-to-br from-[#2F7BFF] via-[#1A4FD6] to-[#0B2A8F] p-5 shadow-[0_20px_60px_rgba(31,107,255,0.4)]">
-            <p className="text-sm text-white/75">Wallet balance</p>
-            <p className={`${DISPLAY} mt-1 text-4xl font-bold tracking-tight`}>
-              <span className="mr-1 text-xl font-bold">GH₵</span>
-              {money(wallet.balance)}
-            </p>
-            <div className="mt-4 grid grid-cols-2 gap-3 text-sm">
-              <div className="rounded-2xl bg-black/20 p-3">
-                <p className="text-[11px] text-white/70">You can withdraw</p>
-                <p className="font-bold">GH₵ {money(withdrawable)}</p>
-              </div>
-              <div className="rounded-2xl bg-black/20 p-3">
-                <p className="text-[11px] text-white/70">Kept in wallet</p>
-                <p className="font-bold">GH₵ {money(Math.min(wallet.balance, MIN_WALLET_BALANCE))}</p>
-              </div>
-            </div>
-            <p className={`mt-4 inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-xs font-bold ${walletReady ? 'bg-emerald-400/25 text-emerald-100' : 'bg-[#F5B82E] text-[#2A1B00]'}`}>
-              <Icon name={walletReady ? 'check' : 'lock'} className="h-3.5 w-3.5" />
-              {walletReady ? `Deposit GH₵ ${MIN_WALLET_BALANCE} — Paid` : `Deposit GH₵ ${MIN_WALLET_BALANCE} — add GH₵ ${money(shortfall)} to accept jobs`}
-            </p>
-          </section>
-
-          <div className="grid grid-cols-2 gap-3">
-            <button onClick={() => openDeposit()} className={`${BTN_GOLD} flex items-center justify-center gap-2 py-3.5 text-sm`}>
-              <Icon name="plus" className="h-4 w-4" /> Deposit
-            </button>
-            <button onClick={openWithdraw} disabled={withdrawable <= 0} className={`${BTN_GHOST} py-3.5 text-sm`}>
-              Withdraw
-            </button>
-          </div>
-
-          <section className={`${CARD} p-4`}>
-            <h3 className="mb-3 text-sm font-bold">Earnings</h3>
-            <div className="grid grid-cols-3 gap-2 text-center">
-              {(['today', 'week', 'month'] as const).map(p => (
-                <div key={p} className="rounded-2xl bg-white/5 p-3">
-                  <p className="text-base font-bold text-[#6DB7FF]">{money(periodStats[p].earned)}</p>
-                  <p className="text-[11px] text-white/50">{PERIOD_LABEL[p]}</p>
-                  <p className="text-[11px] text-white/35">{periodStats[p].trips} trips</p>
+          <div>
+            <p className={`mb-2 text-xs font-semibold ${K.sub}`}>This week: scheduled vs ridden</p>
+            <div className="flex h-24 items-end gap-2" role="img" aria-label="Scheduled hours compared with hours ridden each day">
+              {sched.map((s, i) => (
+                <div key={i} className="flex h-full flex-1 flex-col items-center justify-end gap-1">
+                  <div className="flex h-full w-full items-end gap-0.5"><div className={`flex-1 rounded-t ${K.soft}`} style={{ height: `${s.on ? ((s.to - s.from) / 14) * 100 : 0}%` }} /><div className="flex-1 rounded-t bg-[#F9D342]" style={{ height: `${(ACTUAL_HRS[i] / 14) * 100}%` }} /></div>
+                  <span className={`text-[10px] font-semibold ${K.faint}`}>{DAYS[i][0]}</span>
                 </div>
               ))}
             </div>
-            <div className="mt-4">
-              <div className="mb-1.5 flex items-center justify-between text-xs">
-                <span className="text-white/60">
-                  Daily goal · {goalPct}% of GH₵ {dailyGoal}
-                </span>
-                <button onClick={() => setShowGoal(true)} className="inline-flex items-center gap-1 font-bold text-[#6DB7FF]">
-                  <Icon name="edit" className="h-3 w-3" /> Edit
-                </button>
-              </div>
-              <div className="h-2.5 overflow-hidden rounded-full bg-white/10">
-                <div className="h-full rounded-full bg-gradient-to-r from-[#2F80FF] to-[#F5B82E] transition-all" style={{ width: `${goalPct}%` }} />
-              </div>
-            </div>
-            <p className="mt-3 text-center text-[11px] text-white/35">Service fee: {wallet.commission_rate} per trip</p>
-          </section>
-
-          <section className={`${CARD} p-4`}>
-            <div className="mb-3 flex items-center justify-between">
-              <h3 className="text-sm font-bold">Transactions</h3>
-              <div className="flex gap-1.5">
-                {(['all', 'today', 'week'] as const).map(f => (
-                  <button key={f} onClick={() => setTxFilter(f)} className={`rounded-full border px-3 py-1 text-[11px] font-bold ${txFilter === f ? CHIP_ON : CHIP_OFF}`}>
-                    {f === 'all' ? 'All' : f === 'today' ? 'Today' : 'This week'}
-                  </button>
-                ))}
-              </div>
-            </div>
-            {txs.length === 0 ? (
-              <p className="py-6 text-center text-sm text-white/40">No transactions yet</p>
-            ) : (
-              <div className="divide-y divide-white/5">
-                {txs.map(tx => {
-                  const credit = txIsCredit(tx);
-                  const pending = tx.status && !['completed', 'success'].includes(tx.status);
-                  return (
-                    <div key={tx.id} className="flex items-center gap-3 py-3">
-                      <span className={`flex h-9 w-9 items-center justify-center rounded-full ${credit ? 'bg-emerald-500/15 text-emerald-400' : 'bg-red-500/15 text-red-400'}`}>
-                        <Icon name={tx.type === 'withdrawal' ? 'logout' : tx.type === 'referral_bonus' ? 'gift' : 'wallet'} className="h-4 w-4" />
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-semibold">{TX_LABEL[tx.type] || tx.description || tx.type}</p>
-                        <p className="text-xs text-white/40">
-                          {shortDate(tx.created_at)}
-                          {pending ? ` · ${tx.status}` : ''}
-                        </p>
-                      </div>
-                      <div className="text-right">
-                        <p className={`text-sm font-bold ${credit ? 'text-emerald-400' : 'text-red-400'}`}>
-                          {credit ? '+' : '−'} GH₵ {money(txAmount(tx))}
-                        </p>
-                        {Number(tx.commission) > 0 && <p className="text-[11px] text-white/35">Fee GH₵ {money(Number(tx.commission))}</p>}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        </div>
-      </>
-    );
-  };
-
-  // ─── ALERTS ───
-  const NOTE_STYLE: Record<NoteKind, { icon: string; tone: string }> = {
-    job: { icon: 'bell', tone: 'bg-[#1F6BFF]/20 text-[#6DB7FF]' },
-    cancelled: { icon: 'close', tone: 'bg-red-500/15 text-red-400' },
-    payment: { icon: 'wallet', tone: 'bg-emerald-500/15 text-emerald-400' },
-    account: { icon: 'shield', tone: 'bg-[#F5B82E]/15 text-[#F5B82E]' },
-    system: { icon: 'chat', tone: 'bg-white/10 text-white/70' },
-  };
-  const renderAlerts = () => (
-    <>
-      {header('Alerts')}
-      <div className="space-y-3 px-4">
-        <div className="flex items-center justify-between">
-          <p className="text-xs text-white/50">{unread ? `${unread} unread` : 'All caught up'}</p>
-          <div className="flex gap-4 text-xs font-bold text-[#6DB7FF]">
-            <button onClick={() => setNotes(prev => prev.map(n => ({ ...n, read: true })))} disabled={!unread} className="disabled:opacity-40">
-              Mark all read
-            </button>
-            <button onClick={() => setNotes([])} disabled={!notes.length} className="disabled:opacity-40">
-              Clear all
-            </button>
           </div>
-        </div>
-        {notes.length === 0 ? (
-          <div className={`${CARD} p-10 text-center`}>
-            <p className="mb-2 text-4xl">🔔</p>
-            <p className="font-bold">No notifications yet</p>
-            <p className="mt-1 text-sm text-white/50">New requests, payments and account updates show up here.</p>
-          </div>
-        ) : (
-          notes.map(n => (
-            <button key={n.id} onClick={() => openNote(n)} className={`flex w-full items-start gap-3 rounded-2xl border p-3 text-left ${n.read ? 'border-white/5 bg-white/[0.03]' : 'border-[#4AA3FF]/30 bg-[#1F6BFF]/10'}`}>
-              <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${NOTE_STYLE[n.kind].tone}`}>
-                <Icon name={NOTE_STYLE[n.kind].icon} className="h-[18px] w-[18px]" />
-              </span>
-              <span className="min-w-0 flex-1">
-                <span className="flex items-center justify-between gap-2">
-                  <span className="truncate text-sm font-bold">{n.title}</span>
-                  <span className="shrink-0 text-[11px] text-white/40">{timeAgo(n.created_at)}</span>
-                </span>
-                <span className="mt-0.5 block text-xs text-white/60">{n.body}</span>
-              </span>
-              {!n.read && <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-[#4AA3FF]" />}
-            </button>
-          ))
-        )}
-      </div>
-    </>
-  );
+        </Fold>
 
-  // ─── PROFILE ───
-  const renderProfile = () => {
-    const initials = profile.name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
-    return (
-      <>
-        {header('Profile')}
-        <div className="space-y-4 px-4">
-          <section className={`${CARD} p-5 text-center`}>
-            {profile.photo_url ? (
-              <Image src={profile.photo_url} alt="" width={80} height={80} unoptimized className="mx-auto h-20 w-20 rounded-full border-2 border-[#4AA3FF]/60 object-cover" />
-            ) : (
-              <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-[#1F6BFF] text-2xl font-bold">{initials || <Icon name="user" className="h-8 w-8" />}</div>
-            )}
-            <h2 className={`${DISPLAY} mt-3 text-lg font-bold tracking-tight`}>{profile.name}</h2>
-            <div className="mt-1 flex justify-center">
-              <Stars value={profile.rating} />
-            </div>
-            <span className={`mt-2 inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-[11px] font-bold ${statusBadge.cls}`}>
-              <Icon name={statusBadge.icon} className="h-3 w-3" />
-              {restricted ? 'Restricted' : unverified ? 'Verification pending' : 'Verified rider'}
-            </span>
-            <div className="mt-4 grid grid-cols-3 gap-3 text-center">
-              <div>
-                <p className="text-lg font-bold">{profile.rating ? profile.rating.toFixed(1) : '—'}</p>
-                <p className="text-[11px] text-white/50">Rating / {MAX_RATING}</p>
-              </div>
-              <div>
-                <p className="text-lg font-bold">{profile.completed_jobs}</p>
-                <p className="text-[11px] text-white/50">Trips</p>
-              </div>
-              <div>
-                <p className="text-lg font-bold">{profile.vehicle_plate || '—'}</p>
-                <p className="text-[11px] text-white/50">Plate</p>
-              </div>
-            </div>
-            <button
-              onClick={() => {
-                setEditForm({ name: profile.name, phone: profile.phone, email: profile.email });
-                setSheetError('');
-                setShowEdit(true);
-              }}
-              className={`${BTN_GHOST} mt-4 inline-flex items-center gap-2 px-5 py-2 text-sm`}
-            >
-              <Icon name="edit" className="h-4 w-4" /> Edit profile
-            </button>
-          </section>
-
-          <section className={`${CARD} p-4`}>
-            <h3 className="text-sm font-bold">Services I work on</h3>
-            <p className="mb-3 mt-0.5 text-xs text-white/50">Switch a service on to receive its requests. New services need Rydnow approval.</p>
-            <div className="space-y-3">
-              {services.map(s => {
-                const meta = SERVICE_META[s.key];
-                const requested = requestedServices.includes(s.key);
-                return (
-                  <div key={s.key} className="flex items-center gap-3">
-                    <Image src={meta.icon} alt="" width={40} height={40} className="h-10 w-10 object-contain" />
-                    <div className="min-w-0 flex-1">
-                      <p className="text-sm font-bold">{meta.label}</p>
-                      <p className="text-xs text-white/50">{s.approved ? meta.tagline : requested ? 'Request sent' : 'Not approved yet'}</p>
-                    </div>
-                    {s.approved ? (
-                      <Switch on={s.active} onChange={() => toggleService(s.key)} label={`${meta.label} ${s.active ? 'on' : 'off'}`} />
-                    ) : (
-                      <button onClick={() => requestService(s.key)} disabled={requested} className="rounded-full border border-[#4AA3FF] px-3 py-1.5 text-xs font-bold text-[#6DB7FF] disabled:opacity-40">
-                        {requested ? 'Pending' : 'Request'}
-                      </button>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
-          </section>
-
-          <section className={`${CARD} space-y-4 p-4`}>
-            <h3 className="text-sm font-bold">Notifications</h3>
-            {([
-              ['Job alerts', 'jobAlerts'],
-              ['Sound', 'sound'],
-              ['Vibration', 'vibration'],
-            ] as [string, keyof Prefs][]).map(([label, key]) => (
-              <div key={key} className="flex items-center justify-between">
-                <p className="text-sm text-white/80">{label}</p>
-                <Switch on={prefs[key]} onChange={v => updatePrefs({ [key]: v })} label={label} />
-              </div>
-            ))}
-            <div className="border-t border-white/10 pt-4">
-              <p className="mb-2 text-sm font-bold">Language</p>
-              <div className="flex flex-wrap gap-2">
-                {LANGUAGES.map(l => (
-                  <button
-                    key={l}
-                    onClick={() => {
-                      setLanguage(l);
-                      writeJSON('rydn_lang', l);
-                    }}
-                    className={`rounded-full border px-4 py-1.5 text-xs font-bold ${language === l ? CHIP_ON : CHIP_OFF}`}
-                  >
-                    {l}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </section>
-
-          <section className={`${CARD} divide-y divide-white/5`}>
-            {([
-              ['gift', 'Invite & earn', () => setShowInvite(true)],
-              ['shield', 'Safety & emergency', () => setShowSafety(true)],
-              ['doc', 'Privacy policy', () => router.push(PRIVACY_PATH)],
-              ['doc', 'Terms of service', () => router.push(TERMS_PATH)],
-            ] as [string, string, () => void][]).map(([icon, label, run]) => (
-              <button key={label} onClick={run} className="flex w-full items-center gap-3 px-4 py-4 text-left">
-                <span className="flex h-9 w-9 items-center justify-center rounded-full bg-white/5 text-[#6DB7FF]">
-                  <Icon name={icon} className="h-[18px] w-[18px]" />
-                </span>
-                <span className="flex-1 text-sm font-semibold">{label}</span>
-                <Icon name="chevron" className="h-4 w-4 text-white/30" />
+        <Fold k={K} title="Achievements" icon="trophy">
+          {nextBadge && (<div className={`rounded-2xl p-3 ${K.soft}`}>
+            <p className={`text-sm font-bold ${K.ink}`}>{nextBadge.cur}/{nextBadge.target} {nextBadge.unit} → Next: {nextBadge.icon} {nextBadge.name}</p>
+            <div className={`mt-2 h-2.5 overflow-hidden rounded-full ${dark ? 'bg-white/15' : 'bg-[#0A2342]/10'}`}><div className="h-full rounded-full bg-[#F9D342]" style={{ width: `${(nextBadge.cur / nextBadge.target) * 100}%` }} /></div>
+          </div>)}
+          <div className="grid grid-cols-3 gap-2">
+            {BADGES.map(b => (
+              <button key={b.id} onClick={() => setBadgeSel(b.id)} aria-label={`${b.name}, ${b.at ? 'unlocked' : 'locked'}`} className={`flex min-h-[96px] flex-col items-center justify-center gap-1 rounded-2xl p-2 text-center ${PRESS} ${b.at ? 'bg-[#F9D342]/25' : K.soft}`}>
+                <span className={`text-3xl ${b.at ? '' : 'opacity-30 grayscale'}`} aria-hidden="true">{b.icon}</span><span className={`text-[11px] font-bold leading-tight ${b.at ? K.ink : K.faint}`}>{b.name}</span>
               </button>
             ))}
-            {SUPPORT_PHONE && (
-              <a href={`tel:${SUPPORT_PHONE}`} className="flex w-full items-center gap-3 px-4 py-4">
-                <span className="flex h-9 w-9 items-center justify-center rounded-full bg-white/5 text-[#6DB7FF]">
-                  <Icon name="phone" className="h-[18px] w-[18px]" />
-                </span>
-                <span className="flex-1 text-sm font-semibold">Help & support · call admin</span>
-                <Icon name="chevron" className="h-4 w-4 text-white/30" />
-              </a>
-            )}
-          </section>
+          </div>
+        </Fold>
 
-          <button
-            onClick={() => (activeJob ? notify('Finish your current trip before signing out.', 'error') : setShowLogout(true))}
-            className="flex w-full items-center justify-center gap-2 rounded-full border border-red-400/30 bg-red-500/10 py-3.5 text-sm font-bold text-red-300"
-          >
-            <Icon name="logout" className="h-[18px] w-[18px]" /> Sign out
-          </button>
-        </div>
-      </>
+        <Fold k={K} title="Settings" icon="sliders">
+          <div><p className={`mb-2 text-sm font-bold ${K.ink}`}>Appearance</p>
+            <div className={`grid grid-cols-3 rounded-full p-1 ${K.soft}`} role="radiogroup" aria-label="Theme">
+              {([['light', 'Light'], ['dark', 'Dark'], ['system', 'System']] as [ThemePref, string][]).map(([v, l]) => <button key={v} role="radio" aria-checked={themePref === v} onClick={() => setTheme(v)} className={`${TAP} rounded-full text-xs font-bold ${themePref === v ? `${K.btn} shadow` : K.sub}`}>{l}</button>)}
+            </div>
+          </div>
+          <div className="flex items-center justify-between"><span className={`text-sm font-bold ${K.ink}`}>Quiet hours (11 PM – 6 AM)</span><Toggle k={K} on={quiet} onChange={setQuietHours} label="Quiet hours" /></div>
+        </Fold>
+
+        <Fold k={K} title="Security" icon="lock">
+          <button onClick={() => setPwOpen(true)} className={`w-full ${ghost}`}>Change password</button>
+          <div className="flex items-center justify-between gap-2"><div><p className={`text-sm font-bold ${K.ink}`}>Two-factor authentication</p><p className={`text-xs ${K.sub}`}>{twoFA ? 'On: codes are sent by SMS.' : 'Add a code step when you sign in.'}</p></div>
+            <Toggle k={K} on={twoFA} onChange={v => (v ? setTwoFAOpen(true) : (setTwoFA(false), notify('Two-factor authentication is off.', 'info')))} label="Two-factor authentication" /></div>
+          <p className={`text-sm font-bold ${K.ink}`}>Active sessions</p>
+          <ul className={`divide-y ${K.divide}`}>
+            {sessions.map(s => (
+              <li key={s.id} className="flex items-center gap-2 py-2"><div className="min-w-0 flex-1"><p className={`truncate text-sm font-bold ${K.ink}`}>{s.device}</p><p className={`text-xs ${K.faint}`}>{s.where} · {s.seen}</p></div>
+                {s.current ? <span className="text-xs font-bold text-emerald-500">This device</span> : <button onClick={() => { setSessions(p => p.filter(x => x.id !== s.id)); notify('Device signed out.', 'ok'); }} className={`${TAP} rounded-full border px-3 text-xs font-bold text-red-500 ${K.line}`}>Log out</button>}</li>
+            ))}
+          </ul>
+          {sessions.length > 1 && <button onClick={() => setLogoutAll(true)} className={`w-full ${TAP} rounded-full border border-red-300 text-sm font-bold text-red-500 ${PRESS}`}>Log out all other devices</button>}
+        </Fold>
+
+        <Fold k={K} title="Help centre" icon="book">
+          <input type="search" value={helpQ} onChange={e => setHelpQ(e.target.value)} placeholder="Search help articles…" aria-label="Search help articles" className={`${TAP} w-full rounded-xl border px-3 text-base outline-none focus:ring-2 focus:ring-[#F9D342] ${K.input}`} />
+          <div className="-mx-1 flex flex-wrap gap-2 px-1">{HELP_CATS.map(c => <button key={c} onClick={() => setHelpCat(helpCat === c ? null : c)} aria-pressed={helpCat === c} className={chip(helpCat === c)}>{c}</button>)}</div>
+          {faqs.length === 0 ? <p className={`py-3 text-center text-sm ${K.sub}`}>No articles match. Try different words or call us below.</p> : (
+            <ul className={`divide-y ${K.divide}`}>
+              {faqs.map(f => (
+                <li key={f.q}><button onClick={() => setHelpOpen(helpOpen === f.q ? null : f.q)} aria-expanded={helpOpen === f.q} className={`flex ${TAP} w-full items-center justify-between gap-2 py-2 text-left text-sm font-bold ${K.ink}`}>{f.q}<span className={helpOpen === f.q ? 'rotate-90' : ''}>›</span></button>
+                  {helpOpen === f.q && <p className={`pb-3 text-sm ${K.sub}`}>{f.a}</p>}</li>
+              ))}
+            </ul>
+          )}
+          <p className={`text-center text-xs ${K.sub}`}>Still can’t find what you need?</p>
+        </Fold>
+
+        <Fold k={K} title="Support" icon="support" open>
+          <div className="flex gap-3">
+            <a href={`tel:${SUPPORT_PHONE}`} className={`flex flex-1 items-center justify-center ${gold}`}>{L('phone', 'Call')}</a>
+            <a href={`https://wa.me/233${SUPPORT_PHONE.slice(1)}`} target="_blank" rel="noopener noreferrer" className={`flex flex-1 items-center justify-center ${ghost}`}>{L('chat', 'WhatsApp')}</a>
+          </div>
+          <button onClick={() => { setGuideOpen(true); changeTab('home'); }} className={`${TAP} text-sm font-semibold underline ${K.sub}`}>Read rider guidelines again</button>
+        </Fold>
+
+        <button onClick={logout} className={`w-full ${TAP} rounded-full border border-red-300 bg-red-50 text-sm font-bold text-red-600 ${PRESS}`}>Log out</button>
+      </div>
     );
   };
 
-  // ─── GATE SCREENS (after all hooks) ───
-  const shell = `${bodyFont.className} antialiased mx-auto flex min-h-[100dvh] max-w-lg flex-col items-center justify-center bg-[#050B1A] px-8 text-center text-white`;
-  if (profileState === 'loading' || profileState === 'unauth') {
-    return (
-      <div className={`${shell} gap-3 text-sm text-white/60`}>
-        <Spinner className="h-6 w-6" />
-        {profileState === 'unauth' ? 'Taking you to sign in…' : 'Loading your rider account…'}
-      </div>
-    );
-  }
-  if (profileState === 'unlinked') {
-    return (
-      <div className={shell}>
-        <p className="mb-4 text-5xl">🛵</p>
-        <h1 className="text-xl font-bold">No rider profile found</h1>
-        <p className="mt-2 text-sm text-white/60">This account isn’t linked to a rider yet. Sign up as a rider, or sign in with the account you registered with.</p>
-        <div className="mt-6 flex w-full gap-3">
-          <button onClick={() => router.push(LOGIN_PATH)} className={`${BTN_GHOST} flex-1 py-3.5 text-sm`}>
-            Sign in
-          </button>
-          <button onClick={() => router.push(RIDER_SIGNUP_PATH)} className={`${BTN_GOLD} flex-1 py-3.5 text-sm`}>
-            Become a rider
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const TABS: { id: Tab; label: string; icon: IconName }[] = [{ id: 'home', label: 'Home', icon: 'pin' }, { id: 'jobs', label: 'Jobs', icon: 'list' }, { id: 'account', label: 'Account', icon: 'user' }];
+  const NOTE_GROUPS: [NoteGroup, string][] = [['jobs', 'New jobs'], ['earnings', 'Earnings & bonuses'], ['system', 'System updates'], ['promos', 'Promotions']];
+  const sel = BADGES.find(b => b.id === badgeSel);
 
-  const goOnlineBtn = (
-    <button
-      onClick={toggleOnline}
-      aria-pressed={isOnline}
-      disabled={locationStatus === 'requesting'}
-      className={`relative flex h-16 w-full items-center rounded-full p-1.5 transition-all duration-300 ${
-        isOnline ? 'bg-gradient-to-r from-[#1F6BFF] to-[#4AA3FF] shadow-[0_10px_40px_rgba(31,107,255,0.6)]' : 'border border-white/15 bg-white/10 backdrop-blur'
-      }`}
-    >
-      <span className={`absolute flex h-[52px] w-[52px] items-center justify-center rounded-full bg-white text-[#04122E] shadow-lg transition-all duration-300 ${isOnline ? 'left-[calc(100%-58px)]' : 'left-1.5'}`}>
-        {locationStatus === 'requesting' ? <Spinner /> : <Icon name="power" />}
-      </span>
-      <span className={`w-full text-center text-base font-bold ${isOnline ? 'pr-14 text-[#04122E]' : 'pl-14 text-white/80'}`}>{isOnline ? 'Go Offline' : 'Go Online'}</span>
-    </button>
-  );
-  const busy = activeJob ? busyId === String(activeJob.id) : false;
-  const tripBtn = (label: string, run: () => void, cls = BTN_PRIMARY) => (
-    <button onClick={run} disabled={busy} className={`${cls} flex h-16 w-full items-center justify-center gap-2 text-base`}>
-      {busy && <Spinner />}
-      {label}
-    </button>
-  );
-
+  // ─── RENDER ───
   return (
-    <div
-      className={`${bodyFont.className} antialiased relative mx-auto flex min-h-[100dvh] max-w-lg flex-col overflow-x-hidden bg-[#050B1A] bg-[radial-gradient(70%_32%_at_50%_-4%,rgba(31,107,255,0.5),transparent_70%),radial-gradient(45%_28%_at_100%_62%,rgba(31,107,255,0.2),transparent_70%),radial-gradient(40%_25%_at_0%_85%,rgba(31,107,255,0.14),transparent_70%)] text-white`}
-    >
-      {/* Toast */}
+    <div className={`mx-auto min-h-[100dvh] max-w-lg ${K.page} ${K.ink}`} onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
+      {/* Fixed header */}
+      <header className={`fixed inset-x-0 top-0 z-40 mx-auto flex max-w-lg items-center gap-1.5 px-3 pb-2 pt-[calc(0.5rem+env(safe-area-inset-top))] shadow-sm backdrop-blur ${K.nav}`}>
+        <div className={`shrink-0 rounded-xl ${dark ? 'bg-white px-1.5' : ''}`}><Logo /></div>
+        <div className="min-w-0 flex-1 text-center">
+          <p className="truncate text-sm font-extrabold">{rider.name}</p>
+          <span className={`inline-block rounded-full px-2 py-0.5 text-[10px] font-bold ${BADGE[docState].cls}`}><Icon name={BADGE[docState].icon} className="mr-0.5 inline h-3 w-3" />{BADGE[docState].label}</span>
+        </div>
+        <div className="flex shrink-0 items-center">
+          <button onClick={() => setWalletOpen(true)} className={`${TAP} rounded-full ${K.btn} px-2.5 text-xs font-extrabold ${PRESS}`} aria-label={`Wallet, balance ${money(walletBal)} cedis`}><span className="flex items-center gap-1"><Icon name="wallet" className="h-4 w-4" />₵{money(walletBal)}</span></button>
+          <button onClick={() => setNotesOpen(true)} className={`relative flex h-11 w-11 items-center justify-center rounded-full ${PRESS}`} aria-label={`Notifications${unread ? `, ${unread} unread` : ''}`}><Icon name="bell" className="h-5 w-5" />{unread > 0 && <span className="absolute right-0.5 top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-1 text-[9px] font-bold text-white">{unread}</span>}</button>
+          <button onClick={() => setSafetyOpen(true)} className={`flex h-11 w-11 items-center justify-center rounded-full ${PRESS}`} aria-label="Safety centre"><Icon name="shield" className="h-5 w-5" /></button>
+        </div>
+      </header>
+
       {toast && (
-        <div className="fixed left-1/2 top-[calc(1rem+env(safe-area-inset-top))] z-[70] w-[90%] max-w-sm -translate-x-1/2" role="status" aria-live="polite">
-          <div className={`rounded-2xl px-4 py-3 text-center text-sm font-semibold shadow-xl ${toast.type === 'success' ? 'bg-emerald-600' : toast.type === 'error' ? 'bg-red-600' : 'bg-[#1F6BFF]'}`}>{toast.message}</div>
+        <div className="fixed left-1/2 top-[calc(4.75rem+env(safe-area-inset-top))] z-[70] w-[90%] max-w-sm -translate-x-1/2" role="status" aria-live="polite">
+          <p className={`rounded-2xl px-4 py-3 text-center text-sm font-semibold text-white shadow-xl ${toast.type === 'ok' ? 'bg-emerald-600' : toast.type === 'err' ? 'bg-red-600' : 'bg-[#0A2342] ring-1 ring-white/20'}`}>{toast.msg}</p>
         </div>
       )}
 
-      {/* Incoming job alert */}
-      {alertJob && (
-        <JobAlert
-          booking={alertJob.booking}
-          expiresAt={alertJob.expiresAt}
-          walletReady={walletReady}
-          earn={earnOf(alertJob.booking)}
-          onDecline={() => declineJob(alertJob.booking.id)}
-          onAccept={() => acceptJob(alertJob.booking)}
-          onExpire={() => declineJob(alertJob.booking.id, true)}
-        />
-      )}
-
-      <main className={`flex-1 ${activeTab === 'home' ? 'pb-[calc(11rem+env(safe-area-inset-bottom))]' : 'pb-[calc(6.5rem+env(safe-area-inset-bottom))]'}`}>
-        {activeTab === 'home' && renderHome()}
-        {activeTab === 'trips' && renderTrips()}
-        {activeTab === 'wallet' && renderWallet()}
-        {activeTab === 'alerts' && renderAlerts()}
-        {activeTab === 'profile' && renderProfile()}
+      <main className="px-4 pb-[calc(11rem+env(safe-area-inset-bottom))] pt-[calc(5rem+env(safe-area-inset-top))]">
+        <div className="flex justify-center overflow-hidden transition-[height]" style={{ height: refreshing ? 36 : pull / 2 }} aria-hidden={!refreshing}>{(refreshing || pull > 30) && <Spinner />}</div>
+        <div className={`transition duration-150 ${shown ? 'translate-y-0 opacity-100' : 'translate-y-2 opacity-0'}`}>
+          {tab === 'home' && homeTab()}
+          {tab === 'jobs' && jobsTab()}
+          {tab === 'account' && accountTab()}
+        </div>
       </main>
 
-      {/* Primary action dock (home only) */}
-      {activeTab === 'home' && (
-        <div className="fixed inset-x-0 bottom-[calc(4.75rem+env(safe-area-inset-bottom))] z-30 mx-auto max-w-lg px-4">
-          {!activeJob && goOnlineBtn}
-          {activeJob?.status === 'assigned' && tripBtn('I’ve Arrived', () => tripAction('/arrive-ride/', 'arrived', 'Could not confirm arrival.'))}
-          {activeJob?.status === 'arrived' && tripBtn('Start Trip', () => tripAction('/start-ride/', 'in_progress', 'Could not start the trip.'))}
-          {activeJob?.status === 'in_progress' && tripBtn('Complete Trip', () => setConfirmComplete(true), BTN_GREEN)}
-        </div>
-      )}
+      {/* Fixed status bar: the most important control */}
+      <div className="fixed inset-x-0 bottom-[calc(4.5rem+env(safe-area-inset-bottom))] z-30 mx-auto max-w-lg px-4">
+        <button onClick={toggleOnline} aria-pressed={online} className={`flex h-16 w-full items-center justify-center gap-3 rounded-full text-lg font-black tracking-wide text-white shadow-xl transition active:scale-[0.98] ${online ? 'bg-red-500 shadow-red-500/40' : 'bg-emerald-500 shadow-emerald-500/40'}`}>
+          <span aria-hidden="true" className={`h-3.5 w-3.5 rounded-full bg-white ${online ? '' : 'animate-pulse'}`} />{online ? 'GO OFFLINE' : 'GO ONLINE'}
+        </button>
+      </div>
 
-      {/* Bottom navigation */}
-      <nav className="fixed inset-x-0 bottom-0 z-40 mx-auto max-w-lg border-t border-white/10 bg-[#071027]/90 pb-[env(safe-area-inset-bottom)] backdrop-blur-xl" aria-label="Main">
-        <div className="flex justify-around px-2 py-2">
-          {(
-            [
-              { id: 'home', label: 'Home', icon: 'home' },
-              { id: 'trips', label: 'Trips', icon: 'trips' },
-              { id: 'wallet', label: 'Wallet', icon: 'wallet' },
-              { id: 'alerts', label: 'Alerts', icon: 'bell' },
-              { id: 'profile', label: 'Profile', icon: 'user' },
-            ] as { id: TabType; label: string; icon: string }[]
-          ).map(tab => {
-            const active = activeTab === tab.id;
-            const badge = tab.id === 'alerts' ? unread : 0;
-            const dot = tab.id === 'wallet' && walletLoaded && !walletReady;
-            return (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                aria-current={active ? 'page' : undefined}
-                className={`relative flex min-w-[3.5rem] flex-col items-center gap-0.5 rounded-2xl px-3 py-1.5 text-[11px] font-semibold transition ${active ? 'bg-[#1F6BFF]/20 text-[#6DB7FF]' : 'text-white/40'}`}
-              >
-                <span className="relative">
-                  <Icon name={tab.icon} className="h-6 w-6" />
-                  {badge > 0 && <span className="absolute -right-2.5 -top-1.5 flex h-[18px] min-w-[18px] items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white">{badge > 9 ? '9+' : badge}</span>}
-                  {dot && <span className="absolute -right-1 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-[#071027] bg-[#F5B82E]" />}
-                </span>
-                {tab.label}
-              </button>
-            );
-          })}
+      <nav className={`fixed inset-x-0 bottom-0 z-40 mx-auto max-w-lg border-t pb-[env(safe-area-inset-bottom)] ${K.line} ${K.nav}`} aria-label="Main">
+        <div className="grid grid-cols-3">
+          {TABS.map(t => (
+            <button key={t.id} onClick={() => changeTab(t.id)} aria-current={tab === t.id ? 'page' : undefined} className={`flex min-h-[56px] flex-col items-center gap-0.5 py-2 text-xs font-bold transition active:scale-95 ${tab === t.id ? K.ink : K.faint}`}>
+              <span className={`flex justify-center rounded-full px-5 py-1 transition ${tab === t.id ? 'bg-[#F9D342]' : ''}`} aria-hidden="true"><Icon name={t.icon} className="h-5 w-5" /></span>{t.label}
+            </button>
+          ))}
         </div>
       </nav>
 
-      {/* Sheets */}
-      {showDeposit && paySheet('deposit')}
-      {showWithdraw && paySheet('withdraw')}
-
-      {showLocPrompt && (
-        <Sheet title="Allow location access?" onClose={() => setShowLocPrompt(false)}>
-          <p className="mb-5 text-sm text-white/60">Allow location access to see nearby rides. Your position is shared with customers only while you’re online or on a trip.</p>
-          <div className="flex gap-3">
-            <button onClick={() => setShowLocPrompt(false)} className={`${BTN_GHOST} flex-1 py-3.5`}>
-              Not now
-            </button>
-            <button
-              onClick={() => {
-                setShowLocPrompt(false);
-                setPendingOnline(true);
-                requestLocation();
-              }}
-              className={`${BTN_PRIMARY} flex-[2] py-3.5`}
-            >
-              Allow location
-            </button>
-          </div>
-        </Sheet>
-      )}
-
-      {showGoal && (
-        <Sheet title="Daily earnings goal" onClose={() => setShowGoal(false)}>
-          <p className="mb-4 text-sm text-white/60">Pick a goal and track your progress on the home screen.</p>
-          <div className="grid grid-cols-4 gap-2">
-            {[100, 150, 200, 300].map(v => (
-              <button
-                key={v}
-                onClick={() => {
-                  setDailyGoal(v);
-                  writeJSON('rydn_daily_goal', v);
-                  setShowGoal(false);
-                }}
-                className={`rounded-xl border-2 py-3 text-sm font-bold ${dailyGoal === v ? CHIP_ON : CHIP_OFF}`}
-              >
-                {v}
-              </button>
-            ))}
-          </div>
-        </Sheet>
-      )}
-
-      {showEdit && (
-        <Sheet title="Edit profile" onClose={() => setShowEdit(false)} locked={sheetBusy}>
-          {(
-            [
-              ['Full name', 'name', 'text'],
-              ['Phone', 'phone', 'tel'],
-              ['Email', 'email', 'email'],
-            ] as [string, 'name' | 'phone' | 'email', string][]
-          ).map(([label, key, type]) => (
-            <div key={key} className="mb-3">
-              <label htmlFor={`edit-${key}`} className={LABEL}>
-                {label}
-              </label>
-              <input id={`edit-${key}`} type={type} value={editForm[key]} onChange={e => setEditForm(f => ({ ...f, [key]: e.target.value }))} className={INPUT} />
+      {walletOpen && (
+        <div className={`fixed inset-0 z-50 overflow-y-auto ${K.page} ${K.ink}`} role="dialog" aria-modal="true" aria-label="Wallet"
+          onTouchStart={e => e.stopPropagation()} onTouchMove={e => e.stopPropagation()} onTouchEnd={e => e.stopPropagation()}>
+          <div className="mx-auto max-w-lg px-4 pb-[calc(2rem+env(safe-area-inset-bottom))]">
+            <header className={`sticky top-0 z-10 -mx-4 mb-4 flex items-center gap-3 px-4 pb-3 pt-[calc(0.75rem+env(safe-area-inset-top))] backdrop-blur ${K.nav}`}>
+              <button onClick={() => setWalletOpen(false)} aria-label="Back" className={`flex h-11 w-11 items-center justify-center rounded-full ${K.soft} ${PRESS}`}><Icon name="back" className="h-5 w-5" /></button>
+              <h1 className="flex-1 text-lg font-extrabold">Wallet</h1>
+              <Icon name="wallet" className={`h-6 w-6 ${K.faint}`} />
+            </header>
+            <section className={`rounded-3xl p-5 shadow-[0_10px_30px_rgba(10,35,66,0.3)] ${K.hero}`}>
+              <p className="text-xs text-white/70">Wallet balance</p>
+              <p className="text-4xl font-black tracking-tight text-[#F9D342]">GH₵ {money(walletBal)}</p>
+              <p className="mt-2 flex items-center gap-1.5 text-xs text-white/70"><Icon name={dest?.type === 'card' ? 'card' : 'mobile'} className="h-4 w-4" />{dest ? `Payout method ${dest.masked}` : 'Your first deposit sets your payout method'}</p>
+            </section>
+            <div className="mt-4 grid grid-cols-2 gap-3" role="tablist" aria-label="Wallet action">
+              {([['deposit', 'Deposit'], ['withdraw', 'Withdraw']] as const).map(([v, l]) => (
+                <button key={v} role="tab" aria-selected={walletView === v} onClick={() => setWalletView(v)} className={`${TAP} flex items-center justify-center gap-2 rounded-2xl text-sm font-extrabold ${PRESS} ${walletView === v ? 'bg-[#F9D342] text-[#0A2342]' : `${K.card} ${K.ink}`}`}><Icon name={v} className="h-5 w-5" />{l}</button>
+              ))}
             </div>
-          ))}
-          {sheetError && (
-            <p className="mb-3 rounded-xl border border-red-400/30 bg-red-500/10 px-3 py-2 text-sm text-red-300" role="alert">
-              {sheetError}
-            </p>
-          )}
-          <button onClick={saveProfile} disabled={sheetBusy} className={`${BTN_PRIMARY} flex w-full items-center justify-center gap-2 py-3.5`}>
-            {sheetBusy && <Spinner />} Save changes
-          </button>
-        </Sheet>
-      )}
-
-      {showLogout && (
-        <Sheet title="Sign out?" onClose={() => setShowLogout(false)}>
-          <p className="mb-5 text-sm text-white/60">You’ll go offline and stop receiving requests.</p>
-          <div className="flex gap-3">
-            <button onClick={() => setShowLogout(false)} className={`${BTN_GHOST} flex-1 py-3.5`}>
-              Stay signed in
-            </button>
-            <button onClick={logout} className="flex-[1.4] rounded-full bg-red-500 py-3.5 font-bold text-white">
-              Sign out
-            </button>
-          </div>
-        </Sheet>
-      )}
-
-      {showInvite && (
-        <Sheet title="Invite & earn" onClose={() => setShowInvite(false)}>
-          <div className="mb-4 grid grid-cols-2 rounded-2xl bg-white/5 p-1" role="tablist">
-            {(['riders', 'customers'] as const).map(a => (
-              <button key={a} role="tab" aria-selected={inviteAudience === a} onClick={() => setInviteAudience(a)} className={`rounded-xl py-2 text-sm font-bold ${inviteAudience === a ? 'bg-[#1F6BFF] text-white' : 'text-white/60'}`}>
-                {a === 'riders' ? 'Invite a rider' : 'Invite a customer'}
-              </button>
-            ))}
-          </div>
-          <div className="rounded-3xl bg-gradient-to-br from-[#2F7BFF] to-[#0B2A8F] p-5 text-center">
-            <p className="text-xs font-bold text-[#FFD25E]">Earn GH₵ {inviteAudience === 'riders' ? RIDER_INVITE_REWARD : CUSTOMER_INVITE_REWARD} per friend</p>
-            <p className={`${DISPLAY} mt-2 text-3xl font-bold tracking-widest`}>{myReferralCode}</p>
-            <button
-              onClick={async () => {
-                try {
-                  await navigator.clipboard.writeText(myReferralCode);
-                  notify('Code copied', 'success');
-                } catch {
-                  notify(`Your code is ${myReferralCode}`, 'info');
-                }
-              }}
-              className="mt-3 inline-flex items-center gap-2 rounded-full bg-black/25 px-4 py-2 text-sm font-bold"
-            >
-              <Icon name="copy" className="h-4 w-4" /> Copy code
-            </button>
-          </div>
-          <p className="mt-3 text-xs text-white/50">
-            {inviteAudience === 'riders'
-              ? `GH₵ ${RIDER_INVITE_REWARD} lands in your wallet once your friend is approved and completes their first trips.`
-              : `Your friend gets GH₵ ${CUSTOMER_FRIEND_DISCOUNT} off their first booking. You earn GH₵ ${CUSTOMER_INVITE_REWARD} after it.`}
-          </p>
-          <div className="mt-4 grid grid-cols-3 gap-2 text-center">
-            {[
-              ['Invited', String(referralStats.total)],
-              ['Pending', String(referralStats.pending)],
-              ['Earned', `GH₵ ${money(referralStats.earned)}`],
-            ].map(([l, v]) => (
-              <div key={l} className="rounded-2xl bg-white/5 p-3">
-                <p className="text-base font-bold">{v}</p>
-                <p className="text-[11px] text-white/50">{l}</p>
-              </div>
-            ))}
-          </div>
-          <div className="mt-4 grid grid-cols-2 gap-3">
-            <button onClick={() => shareText('Join Rydnow', inviteMessage(), 'Invite message copied.')} className={`${BTN_GOLD} col-span-2 flex items-center justify-center gap-2 py-3.5 text-sm`}>
-              <Icon name="share" className="h-5 w-5" /> Share invite
-            </button>
-            <a href={`https://wa.me/?text=${encodeURIComponent(inviteMessage())}`} target="_blank" rel="noopener noreferrer" className={`${BTN_GHOST} py-3 text-center text-sm`}>
-              WhatsApp
-            </a>
-            <a href={`sms:?&body=${encodeURIComponent(inviteMessage())}`} className={`${BTN_GHOST} py-3 text-center text-sm`}>
-              Text message
-            </a>
-          </div>
-        </Sheet>
-      )}
-
-      {showSafety && (
-        <Sheet title="Safety & emergency" onClose={() => setShowSafety(false)}>
-          <div className="mb-3 grid grid-cols-3 gap-2">
-            {[
-              ['Police', '191'],
-              ['Ambulance', '193'],
-              ['Emergency', '112'],
-            ].map(([label, num]) => (
-              <a key={num} href={`tel:${num}`} className="rounded-2xl bg-red-600 py-3 text-center">
-                <span className="block text-lg font-bold">{num}</span>
-                <span className="block text-[11px]">{label}</span>
-              </a>
-            ))}
-          </div>
-          {SUPPORT_PHONE && (
-            <a href={`tel:${SUPPORT_PHONE}`} className={`${BTN_GHOST} mb-3 block w-full py-3 text-center text-sm`}>
-              Call Rydnow support
-            </a>
-          )}
-          <a href={safetyShareLink()} target="_blank" rel="noopener noreferrer" className={`${BTN_GOLD} block w-full py-3 text-center text-sm`}>
-            Send my location on WhatsApp
-          </a>
-          <p className="mt-3 text-center text-[11px] text-white/40">Check that these numbers are correct for your area.</p>
-        </Sheet>
-      )}
-
-      {confirmComplete && activeJob && (
-        <Sheet title="Complete this trip?" onClose={() => setConfirmComplete(false)}>
-          <p className="mb-5 text-sm text-white/60">
-            Confirm you’ve finished the {SERVICE_META[normalizeService(activeJob.service_type)].label.toLowerCase()} at <span className="font-bold text-white">{activeJob.destination}</span>. About{' '}
-            <span className="font-bold text-emerald-400">GH₵ {money(earnOf(activeJob))}</span> goes to your wallet.
-          </p>
-          <div className="flex gap-3">
-            <button onClick={() => setConfirmComplete(false)} className={`${BTN_GHOST} flex-1 py-3.5`}>
-              Not yet
-            </button>
-            <button
-              onClick={() => {
-                setConfirmComplete(false);
-                tripAction('/complete-ride/', 'completed', 'Could not complete the trip.');
-              }}
-              className="flex-[2] rounded-full bg-emerald-500 py-3.5 font-bold text-white"
-            >
-              Yes, complete
-            </button>
-          </div>
-        </Sheet>
-      )}
-
-      {summary && (
-        <Sheet title="Trip complete" onClose={() => setSummary(null)}>
-          <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
-            <p className="mb-3 text-xs text-white/50">{summary.service}</p>
-            {routeLine(summary.pickup, summary.destination)}
-            <div className="mt-4 grid grid-cols-2 gap-3 border-t border-white/10 pt-4 text-center">
-              <div>
-                <p className="text-lg font-bold">{summary.km != null ? `${summary.km} km` : '—'}</p>
-                <p className="text-[11px] text-white/50">Distance{summary.min ? ` · ${summary.min} min` : ''}</p>
-              </div>
-              <div>
-                <p className="text-lg font-bold">GH₵ {money(summary.fare)}</p>
-                <p className="text-[11px] text-white/50">Total fare</p>
-              </div>
+            <div className={card('mt-4')}>
+              <WalletPanel k={K} view={walletView} balance={walletBal} totalEarnings={allTimeNet} dest={dest} notify={notify} onDeposit={onWalletDeposit} onWithdraw={onWalletWithdraw} />
             </div>
-            <p className="mt-4 rounded-2xl bg-emerald-500/15 py-3 text-center text-sm font-bold text-emerald-300">Your earnings after fee: GH₵ {money(summary.earn)}</p>
+            <section className="mt-5">
+              <h2 className="mb-2 flex items-center gap-2 font-extrabold"><Icon name="receipt" className="h-5 w-5" />Recent activity</h2>
+              <ul className="space-y-2">
+                {txList.map(t => (
+                  <li key={t.id} className={`flex items-center gap-3 rounded-2xl p-3 ${K.card}`}>
+                    <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${t.amount < 0 ? 'bg-red-100 text-red-600' : 'bg-emerald-100 text-emerald-700'}`}><Icon name={t.kind === 'deposit' ? 'deposit' : t.kind === 'withdraw' ? 'withdraw' : 'bike'} className="h-5 w-5" /></span>
+                    <span className="min-w-0 flex-1"><span className="block truncate text-sm font-bold">{t.label}</span><span className={`block text-xs ${K.faint}`}>{ago(t.at)}</span></span>
+                    <span className={`text-sm font-black ${t.amount < 0 ? 'text-red-500' : ''}`}>{t.amount < 0 ? '−' : '+'}GH₵ {money(Math.abs(t.amount))}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
           </div>
-          <button onClick={() => setSummary(null)} className={`${BTN_PRIMARY} mt-4 w-full py-3.5`}>
-            Done — Back to Online
-          </button>
+        </div>
+      )}
+
+      {/* ── Sheets ── */}
+      {notesOpen && (
+        <Sheet k={K} title="Notifications" onClose={() => setNotesOpen(false)}>
+          <div className="mb-3 flex items-center justify-between gap-2">
+            <button onClick={() => setNotes(p => p.map(n => ({ ...n, read: true })))} disabled={!unread} className={`${TAP} text-sm font-bold underline disabled:opacity-40`}>Mark all as read</button>
+            <button onClick={() => setNotes([])} disabled={notes.length === 0} className={`${TAP} text-sm font-bold underline disabled:opacity-40`}>Clear all</button>
+            <label className="flex items-center gap-1 text-xs font-semibold"><span>Quiet 11PM–6AM</span><Toggle k={K} on={quiet} onChange={setQuietHours} label="Quiet hours" /></label>
+          </div>
+          {notes.length === 0 ? empty('bell', 'You’re all caught up', 'New jobs, bonuses and updates show up here.') : NOTE_GROUPS.map(([g, label]) => {
+            const items = notes.filter(n => n.group === g);
+            return items.length === 0 ? null : (
+              <div key={g} className="mb-4"><p className={`mb-2 text-xs font-extrabold ${K.faint}`}>{label}</p>
+                <ul className="space-y-2">{items.map(n => (
+                  <li key={n.id} className={`rounded-2xl p-3 ${n.read ? K.soft : 'bg-[#F9D342]/25'}`}>
+                    <div className="flex gap-3"><span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#F9D342]/30"><Icon name={NOTE_ICON[n.group]} className="h-5 w-5" /></span>
+                      <div className="min-w-0 flex-1"><div className="flex justify-between gap-2"><p className="text-sm font-bold">{n.title}</p><span className={`shrink-0 text-[11px] ${K.faint}`}>{ago(n.at)}</span></div><p className={`text-xs ${K.sub}`}>{n.msg}</p></div></div>
+                    <div className="mt-2 flex justify-end gap-2">
+                      {n.action && <button onClick={() => openNoteAction(n)} className={`${TAP} rounded-full ${K.btn} px-4 text-xs font-bold`}>{n.action}</button>}
+                      <button onClick={() => setNotes(p => p.filter(x => x.id !== n.id))} className={`${TAP} rounded-full border px-4 text-xs font-bold ${K.line}`}>Dismiss</button>
+                    </div>
+                  </li>))}</ul></div>
+            );
+          })}
+        </Sheet>
+      )}
+
+      {safetyOpen && (
+        <Sheet k={K} title="Safety centre" onClose={() => setSafetyOpen(false)}>
+          <button onClick={emergency} className={`flex w-full flex-col items-center rounded-3xl bg-red-600 py-5 text-white shadow-lg ${PRESS}`}><Icon name="alert" className="h-8 w-8" /><span className="text-lg font-black">Emergency</span><span className="text-xs text-white/80">Calls {EMERGENCY.name} and opens WhatsApp with your location</span></button>
+          <div className="mt-3 grid grid-cols-2 gap-3">
+            <a href={`https://wa.me/?text=${encodeURIComponent(tripMsg)}`} target="_blank" rel="noopener noreferrer" className={`flex items-center justify-center ${gold}`}>{L('pin', 'Share my trip')}</a>
+            <a href={`sms:?&body=${encodeURIComponent(tripMsg)}`} className={`flex items-center justify-center ${ghost}`}>{L('chat', 'By SMS')}</a>
+          </div>
+          <p className={`mt-2 text-[11px] ${K.faint}`}>{coords ? 'Shares your position right now as a map link.' : 'Location unavailable. Turn on location so contacts can find you.'}</p>
+          <a href={`tel:${EMERGENCY.national}`} className={`mt-3 flex items-center justify-center ${ghost}`}>{L('phone', `Emergency services ${EMERGENCY.national}`)}</a>
+          <a href={`tel:${SUPPORT_PHONE}`} className={`mt-2 flex items-center justify-center ${ghost}`}>{L('support', `Rydnow support ${SUPPORT_PHONE}`)}</a>
+          <button onClick={() => setTipsOpen(o => !o)} aria-expanded={tipsOpen} className={`mt-3 flex ${TAP} w-full items-center justify-between text-sm font-bold`}>💬 Quick safety tips<span className={tipsOpen ? 'rotate-90' : ''}>›</span></button>
+          {tipsOpen && <ul className={`list-disc space-y-1 pl-5 text-sm ${K.sub}`}>{SAFETY_TIPS.map(t => <li key={t}>{t}</li>)}</ul>}
+          <button onClick={() => { setSafetyOpen(false); setCheckin(true); }} className={`mt-3 ${TAP} text-xs font-semibold underline ${K.faint}`}>Preview trip safety check-in</button>
+        </Sheet>
+      )}
+
+      {sel && (
+        <Sheet k={K} title={sel.name} onClose={() => setBadgeSel(null)}>
+          <div className="text-center"><p className={`text-6xl ${sel.at ? '' : 'opacity-30 grayscale'}`} aria-hidden="true">{sel.icon}</p>
+            <p className="mt-3 font-extrabold">{sel.at ? `Unlocked · ${fmtFull(sel.at)}` : `Locked · ${sel.cur}/${sel.target} ${sel.unit}`}</p>
+            <p className={`mt-1 text-sm ${K.sub}`}>{sel.desc}</p></div>
+        </Sheet>
+      )}
+
+      {goalOpen && (
+        <Sheet k={K} title="Daily earnings goal" onClose={() => setGoalOpen(false)}>
+          <div className="mb-3 grid grid-cols-4 gap-2">{[100, 150, 200, 300].map(v => <button key={v} onClick={() => saveGoal(v)} className={`${TAP} rounded-xl border-2 text-sm font-bold ${goal === v ? 'border-[#F9D342] bg-[#F9D342] text-[#0A2342]' : K.line}`}>{v}</button>)}</div>
+          {input('Or enter your own (GH₵)', goalInput, setGoalInput, 'number')}
+          <button onClick={() => saveGoal(Number(goalInput))} className={`w-full ${primary}`}>Save goal</button>
+        </Sheet>
+      )}
+
+      {pwOpen && (
+        <Sheet k={K} title="Change password" onClose={() => setPwOpen(false)}>
+          {input('Current password', pw.cur, v => setPw(p => ({ ...p, cur: v })), 'password')}
+          {input('New password', pw.next, v => setPw(p => ({ ...p, next: v })), 'password')}
+          <div className="mb-3 flex gap-1" role="img" aria-label={`Password strength ${sMeterLabel(strength(pw.next))}`}>{[1, 2, 3, 4].map(n => <span key={n} className={`h-1.5 flex-1 rounded-full ${strength(pw.next) >= n ? (strength(pw.next) <= 1 ? 'bg-red-500' : strength(pw.next) === 2 ? 'bg-amber-500' : 'bg-emerald-500') : K.soft}`} />)}</div>
+          <p className={`-mt-2 mb-3 text-xs ${K.sub}`}>Use 8+ characters with upper and lower case, a number and a symbol. Strength: {sMeterLabel(strength(pw.next))}</p>
+          {input('Confirm new password', pw.again, v => setPw(p => ({ ...p, again: v })), 'password')}
+          <button onClick={submitPw} disabled={saving} className={`flex w-full items-center justify-center gap-2 disabled:opacity-60 ${primary}`}>{saving && <Spinner cls="h-4 w-4" />}Update password</button>
+        </Sheet>
+      )}
+
+      {twoFAOpen && (
+        <Sheet k={K} title="Turn on two-factor authentication" onClose={() => setTwoFAOpen(false)}>
+          <p className={`mb-3 text-sm ${K.sub}`}>When you sign in, we’ll text a 6-digit code to {rider.phone}. This keeps your earnings safe even if someone learns your password.</p>
+          {input('6-digit code (demo: any 6 digits)', code, v => setCode(v.replace(/\D/g, '').slice(0, 6)), 'text', '123456')}
+          <button onClick={enable2FA} className={`w-full ${primary}`}>Turn on</button>
+        </Sheet>
+      )}
+
+      {logoutAll && (
+        <Sheet k={K} title="Log out other devices?" onClose={() => setLogoutAll(false)}>
+          <p className={`mb-4 text-sm ${K.sub}`}>You’ll stay signed in here. Every other device will be signed out.</p>
+          <div className="flex gap-3"><button onClick={() => setLogoutAll(false)} className={`flex-1 ${ghost}`}>Cancel</button>
+            <button onClick={() => { setSessions(p => p.filter(s => s.current)); setLogoutAll(false); notify('Other devices signed out.', 'ok'); }} className={`flex-[1.4] ${TAP} rounded-full bg-red-600 text-sm font-bold text-white`}>Log them out</button></div>
+        </Sheet>
+      )}
+
+      {addVeh && (
+        <Sheet k={K} title="Add a vehicle" onClose={() => setAddVeh(false)}>
+          {input('Model', vehForm.model, v => setVehForm(f => ({ ...f, model: v })), 'text', 'e.g. Haojue 125cc')}
+          {input('Plate number', vehForm.plate, v => setVehForm(f => ({ ...f, plate: v })), 'text', 'GR 0000-24')}
+          {input('Colour', vehForm.color, v => setVehForm(f => ({ ...f, color: v })))}
+          <p className={`mb-3 text-xs ${K.sub}`}>Next you’ll upload its documents. It can be set as active once they’re verified.</p>
+          <button onClick={submitVehicle} className={`w-full ${primary}`}>Add vehicle</button>
+        </Sheet>
+      )}
+
+      {chatOpen && job && customerInfo && (
+        <Sheet k={K} title={`Chat · ${job.customer}`} onClose={() => setChatOpen(false)}>
+          <ChatPanel k={K} customer={customerInfo} msgs={msgs} onSend={sendMsg} arrived={job.stage === 'arrived'} />
+        </Sheet>
+      )}
+
+      {photoOpen && (
+        <Sheet k={K} title="Upload your photo" onClose={() => setPhotoOpen(false)}>
+          <PhotoPanel k={K} current={photoUrl} status={photoStatus} notify={notify}
+            onSave={async (_file, url) => {
+              await new Promise(r => setTimeout(r, 900)); // BACKEND: POST /rider-photo/ (multipart). Admin review sets Verified.
+              setPhotoUrl(url); setPhotoStatus('pending'); setPhotoOpen(false); touchSync();
+              pushNote('system', '📷', 'Photo under review', 'We’ll let you know once it’s verified.');
+            }} />
+        </Sheet>
+      )}
+
+      {proofOpen && job && (
+        <Sheet k={K} title="Proof of delivery" onClose={() => setProofOpen(false)}>
+          <ProofPanel k={K} notify={notify} onSubmit={completeJob} />
         </Sheet>
       )}
     </div>
   );
 }
+
+const sMeterLabel = (n: number) => ['Too short', 'Weak', 'Fair', 'Good', 'Strong'][n];
 

@@ -19,12 +19,14 @@
  */
 import {
   API_BASE_DEFAULT,
+  API_TIMEOUT_MS,
   COORD_DECIMALS,
   ERROR_MESSAGES,
+  QUOTE_RETRY_CODES,
+  SERVICE_HINTS,
   normalizePaymentMethod,
   normalizeServiceKey,
   type ApiErrorKind,
-  type BookingPaymentStatus,
   type BookingStatus,
   type DocumentType,
   type PaymentMethod,
@@ -32,16 +34,21 @@ import {
   type ServiceKey,
   type SurgeReason,
   type VerificationStatus,
-} from "./constants";
+} from "./config";
+
 
 // ---------------------------------------------------------------------------
 // Public type re-exports and aliases
 // ---------------------------------------------------------------------------
-export type { PaymentMethod, Place, ServiceKey } from "./config";
+export type { PaymentMethod, Place, ServiceKey, SurgeReason } from "./config";
 /** A booking as the signed-in customer sees it. */
 export type Booking = BookingDetail;
 /** A price quote returned by booking/calculate-price/. */
 export type Quote = QuoteResponse;
+/** Names used by the previous client, kept so existing screens still compile. */
+export type TripStop = TripStopInput & { address: string; waitMinutes: number };
+export type CreateBookingInput = TripInput;
+
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -52,9 +59,12 @@ export type Quote = QuoteResponse;
  * proxy (and its trailing-slash handling), so only a same-origin path is accepted.
  */
 const rawBase = (process.env.NEXT_PUBLIC_API_BASE || "").trim();
-export const API_BASE = (rawBase.startsWith("/") ? rawBase : API_BASE_DEFAULT).replace(/\/+$/, "");
+// "//host" and "/\\host" are protocol-relative: they would send the token to another origin.
+export const API_BASE = (/^\/(?![/\\])/.test(rawBase) ? rawBase : API_BASE_DEFAULT).replace(/\/+$/, "");
 
-const TOKEN_KEY = process.env.NEXT_PUBLIC_RYDNOW_TOKEN_KEY ?? "rydnow_token";
+
+const TOKEN_KEY = process.env.NEXT_PUBLIC_RYDNOW_TOKEN_KEY || "rydnow_token";
+
 
 /** Read the stored DRF token. Returns null on the server or when storage is unavailable. */
 export function getToken(): string | null {
@@ -66,10 +76,17 @@ export function getToken(): string | null {
   }
 }
 
+
 // ===========================================================================
 // 1. ROUTES (single source of truth: every call below uses these)
 // ===========================================================================
-const seg = (value: string) => encodeURIComponent(value);
+/** One safe path segment. Empty, "." and ".." would silently change which route is called. */
+const seg = (value: string): string => {
+  const v = String(value ?? "").trim();
+  if (!v || v === "." || v === "..") throw validationError("Missing or invalid reference.");
+  return encodeURIComponent(v);
+};
+
 
 export const ROUTES = {
   // ---- api/booking_urls.py -------------------------------------------------
@@ -86,6 +103,7 @@ export const ROUTES = {
   nearbyRiders: "dispatch/rider/nearby/", // GET   NearbyRidersView  (FIX: duplicate "rider/nearby" key removed)
   // booking/webhook/ is provider-to-server only and is intentionally not here.
 
+
   // ---- api/urls.py: auth ---------------------------------------------------
   login: "auth/login/", // POST
   tokenAuth: "auth/token/", // POST  DRF obtain_auth_token
@@ -98,8 +116,10 @@ export const ROUTES = {
   me: "auth/me/", // GET, PATCH
   customerProfile: "profile/", // GET, PATCH
 
+
   // ---- api/urls.py: health -------------------------------------------------
   health: "health/", // GET   {"status": "ok"}
+
 
   // ---- api/urls.py: rider --------------------------------------------------
   offerAccept: (id: string) => `rider/offers/${seg(id)}/accept/`, // POST
@@ -114,13 +134,16 @@ export const ROUTES = {
   riderLocation: "rider/update-location/", // PATCH
   ridersNearbyLegacy: "riders/nearby/", // GET   views.get_nearby_riders
 
+
   // ---- api/urls.py: customer wallet (NO trailing slash, see header) --------
   customerWallet: "customer/wallet", // GET
+
 
   // ---- api/urls.py: payments (Paystack) -------------------------------------
   paymentsInitialize: "payments/initialize/", // POST
   paymentsVerify: "payments/verify/", // POST
   // payments/paystack/webhook/ is Paystack-to-server only and is intentionally not here.
+
 
   /**
    * Routes that exist in urls.py but whose handlers fail in the code reviewed
@@ -143,6 +166,7 @@ export const ROUTES = {
   },
 } as const;    
 
+
 // ===========================================================================
 // 2. ERRORS
 // ===========================================================================
@@ -157,16 +181,18 @@ export interface ApiErrorInit {
   raw?: unknown;
 }
 
+
 export class ApiError extends Error {
   readonly kind: ApiErrorKind;
   readonly status: number;
   readonly method: string;
   readonly url: string;
-  /** Machine code from the backend when it sends one (see BACKEND_ERROR_CODES), plus "route_not_found". */
+  /** Machine code from the backend when it sends one (see QUOTE_RETRY_CODES), plus "route_not_found". */
   readonly code?: string;
   /** Per-field messages from DRF / the booking views. */
   readonly fieldErrors: Record<string, string[]>;
   readonly raw: unknown;
+
 
   constructor(init: ApiErrorInit) {
     super(init.message || ERROR_MESSAGES[init.kind]);
@@ -180,10 +206,12 @@ export class ApiError extends Error {
     this.raw = init.raw;
   }
 
+
   /** Worth offering "Retry". */
   get retryable(): boolean {
     return this.kind === "network" || this.kind === "timeout" || this.kind === "server" || this.kind === "rate_limited";
   }
+
 
   /**
    * Text safe to show a customer. Backend messages are written for users in the kinds below
@@ -199,6 +227,7 @@ export class ApiError extends Error {
     return ERROR_MESSAGES[this.kind];
   }
 
+
   /** A 404 whose body was NOT JSON: the URL matched no route (Django's own 404 page or the proxy),
    *  as opposed to a view saying "record not found". */
   get isRouteNotFound(): boolean {
@@ -206,24 +235,32 @@ export class ApiError extends Error {
   }
 }
 
+
 export const isApiError = (e: unknown): e is ApiError => e instanceof ApiError;
-export const isAbort = (e: unknown): boolean => isApiError(e) && e.kind === "aborted";
+export const isAbort = (e: unknown): boolean =>
+  isApiError(e) ? e.kind === "aborted" : (e as { name?: unknown } | null | undefined)?.name === "AbortError";
+
 
 /**
  * Customer-safe message for any thrown value. ApiErrors use their userMessage;
  * anything else uses `fallback`, then the generic "unknown" copy.
+ * Returns "" for a cancelled request: there is nothing to tell the user.
  */
 export function friendlyError(e: unknown, fallback?: string): string {
+  if (isAbort(e)) return "";
   if (isApiError(e)) return e.userMessage || fallback || ERROR_MESSAGES.unknown;
   return fallback ?? ERROR_MESSAGES.unknown;
 }
 
+
 /** The quote token is missing, expired, used, or issued for a different trip: request a new quote. */
 export function needsNewQuote(e: unknown): boolean {
   if (!isApiError(e)) return false;
-  if (e.code && ["quote_expired", "quote_invalid", "quote_used", "quote_mismatch"].includes(e.code)) return true;
+  if (e.code && QUOTE_RETRY_CODES.includes(e.code)) return true;
+  if (e.status === 410) return true;
   return e.kind === "validation" && Boolean(e.fieldErrors.quote_token?.length);
 }
+
 
 function flatten(value: unknown): string[] {
   if (typeof value === "string") return [value];
@@ -232,7 +269,9 @@ function flatten(value: unknown): string[] {
   return [];
 }
 
+
 const RESERVED_KEYS = new Set(["success", "error", "detail", "message", "code", "details"]);
+
 
 /**
  * Shapes the backend produces:
@@ -246,6 +285,7 @@ function readBody(body: unknown): { message: string; code?: string; fields: Reco
   if (typeof body === "string") return { message: body, fields: {} };
   if (!body || typeof body !== "object" || Array.isArray(body)) return { message: "", fields: {} };
 
+
   const obj = body as Record<string, unknown>;
   const fields: Record<string, string[]> = {};
   const addFields = (source: Record<string, unknown>, skipReserved: boolean) => {
@@ -258,6 +298,7 @@ function readBody(body: unknown): { message: string; code?: string; fields: Reco
   if (obj.details && typeof obj.details === "object") addFields(obj.details as Record<string, unknown>, false);
   addFields(obj, true);
 
+
   const direct = [obj.error, obj.detail, obj.message].flatMap(flatten).filter(Boolean);
   // Skip QuoteView's generic "Invalid request" when it carries field details.
   const message =
@@ -265,6 +306,7 @@ function readBody(body: unknown): { message: string; code?: string; fields: Reco
     Object.values(fields).flat().join(" ");
   return { message, code: typeof obj.code === "string" ? obj.code : undefined, fields };
 }
+
 
 function kindForStatus(status: number): ApiErrorKind {
   if (status === 401) return "auth";
@@ -277,6 +319,7 @@ function kindForStatus(status: number): ApiErrorKind {
   if (status >= 500) return "server";
   return "unknown";
 }
+
 
 // ===========================================================================
 // 3. TRANSPORT
@@ -301,24 +344,30 @@ export const tokenStore = {
   },
 };
 
+
 interface ApiConfig {
   /** Return the DRF token (sent as `Authorization: Token <key>`). Return null if the proxy adds auth itself. */
   getToken: () => string | null | Promise<string | null>;
-  /** Called after a 401 on a request that carried a token. */
-  onUnauthorized?: () => void;
+  /** Called after a 401 on a request that carried a token, with the rejected token. */
+  onUnauthorized?: (rejectedToken: string) => void;
   timeoutMs: number;
 }
 const cfg: ApiConfig = {
   getToken: () => tokenStore.get(),
-  onUnauthorized: () => tokenStore.clear(),
-  timeoutMs: 30_000, // generous: a sleeping Render instance can be slow to answer the first call
+  // A late 401 from an old session must not wipe a token saved by a newer sign-in.
+  onUnauthorized: (rejected) => {
+    if (tokenStore.get() === rejected) tokenStore.clear();
+  },
+  timeoutMs: API_TIMEOUT_MS,
 };
 export function configureApi(partial: Partial<ApiConfig>): void {
   Object.assign(cfg, partial);
 }
 
+
 type QueryValue = string | number | boolean | null | undefined | ReadonlyArray<string | number>;
 export type Query = Record<string, QueryValue>;
+
 
 interface RequestOptions {
   query?: Query;
@@ -331,15 +380,18 @@ interface RequestOptions {
 }
 type Method = "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
 
+
 function buildUrl(path: string, query?: Query): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query ?? {})) {
     if (value === null || value === undefined || value === "") continue;
+    if (Array.isArray(value) && value.length === 0) continue;
     params.set(key, Array.isArray(value) ? value.join(",") : String(value));
   }
   const qs = params.toString();
   return `${API_BASE}/${path.replace(/^\/+/, "")}${qs ? `?${qs}` : ""}`;
 }
+
 
 async function request<T>(method: Method, path: string, o: RequestOptions = {}): Promise<T> {
   const url = buildUrl(path, o.query);
@@ -352,15 +404,17 @@ async function request<T>(method: Method, path: string, o: RequestOptions = {}):
     body = JSON.stringify(o.body);
   }
 
-  let sentToken = false;
+
+  let sentToken: string | null = null;
   if (o.auth !== false) {
     const token = await cfg.getToken();
     if (token) {
       headers.Authorization = `Token ${token}`;
-      sentToken = true;
+      sentToken = token;
     }
   }
   if (o.idempotencyKey) headers["Idempotency-Key"] = o.idempotencyKey;
+
 
   const controller = new AbortController();
   let timedOut = false;
@@ -372,7 +426,11 @@ async function request<T>(method: Method, path: string, o: RequestOptions = {}):
   o.signal?.addEventListener("abort", forwardAbort, { once: true });
   if (o.signal?.aborted) controller.abort();
 
+
+  // The timer and abort listener stay active until the body has been read: a connection
+  // can stall or drop after the headers arrive.
   let res: Response;
+  let text: string;
   try {
     res = await fetch(url, {
       method,
@@ -382,15 +440,16 @@ async function request<T>(method: Method, path: string, o: RequestOptions = {}):
       cache: "no-store",
       credentials: "same-origin",
     });
+    text = await res.text();
   } catch (err) {
-    const kind: ApiErrorKind = timedOut ? "timeout" : o.signal?.aborted ? "aborted" : "network";
+    const kind: ApiErrorKind = o.signal?.aborted ? "aborted" : timedOut ? "timeout" : "network";
     throw new ApiError({ kind, status: 0, method, url, raw: err });
   } finally {
     clearTimeout(timer);
     o.signal?.removeEventListener("abort", forwardAbort);
   }
 
-  const text = await res.text();
+
   let data: unknown = null;
   let isJson = true;
   if (text) {
@@ -400,6 +459,7 @@ async function request<T>(method: Method, path: string, o: RequestOptions = {}):
       isJson = false;
     }
   }
+
 
   if (!res.ok) {
     const parsed = readBody(isJson ? data : null);
@@ -417,7 +477,7 @@ async function request<T>(method: Method, path: string, o: RequestOptions = {}):
       // eslint-disable-next-line no-console
       console.warn(`[rydnow] ${method} ${url} -> ${res.status}${err.isRouteNotFound ? " (no route matched)" : ""}`, err.raw);
     }
-    if (res.status === 401 && sentToken) cfg.onUnauthorized?.();
+    if (res.status === 401 && sentToken) cfg.onUnauthorized?.(sentToken);
     throw err;
   }
   if (text && !isJson) {
@@ -426,15 +486,18 @@ async function request<T>(method: Method, path: string, o: RequestOptions = {}):
   return data as T;
 }
 
+
 const get = <T>(path: string, query?: Query, o: RequestOptions = {}) => request<T>("GET", path, { ...o, query });
 const post = <T>(path: string, body?: unknown, o: RequestOptions = {}) => request<T>("POST", path, { ...o, body });
 const patch = <T>(path: string, body?: unknown, o: RequestOptions = {}) => request<T>("PATCH", path, { ...o, body });
+
 
 // ===========================================================================
 // 4. RESPONSE TYPES
 // ===========================================================================
 /** views.py function views wrap every success as {"success": true, "message"?, ...}. */
 export type Ok<T extends object = object> = { success: true; message?: string } & T;
+
 
 export interface Paginated<T> {
   count: number;
@@ -444,6 +507,7 @@ export interface Paginated<T> {
 }
 /** DRF DecimalFields are serialised as strings. Display them; do not do arithmetic with them. */
 type Decimal = string;
+
 
 // ---- 4.1 Quote (booking_views.QuoteView) ---------------------------------
 export interface QuoteBreakdown {
@@ -493,6 +557,7 @@ export interface QuoteResponse {
   /** Only on the deprecated bookings/quote/ route. */
   surge_multiplier?: number;
 }
+
 
 // ---- 4.2 Bookings (booking_serializers.py) -------------------------------
 export interface BookingListItem {
@@ -565,6 +630,7 @@ export interface StaffBookingDetail extends BookingDetail {
   fare: Record<string, unknown> | null;
 }
 
+
 // ---- 4.3 Riders ----------------------------------------------------------
 export interface NearbyRider {
   id: string;
@@ -587,6 +653,7 @@ export interface LegacyNearbyRider {
   rating_average: number;
   location_updated_at: string | null;
 }
+
 
 // ---- 4.4 Auth / profile --------------------------------------------------
 export type UserRole = "rider" | "staff" | "customer";
@@ -660,6 +727,7 @@ export interface RiderDocumentState {
   url: string | null;
   notes: string;
 }
+
 
 // ---- 4.5 Wallets ---------------------------------------------------------
 export interface CustomerWalletTx {
@@ -736,6 +804,7 @@ export interface WithdrawalOut {
   processed_at: string | null;
 }
 
+
 // ---- 4.6 Payments --------------------------------------------------------
 export interface InitializePaymentBody {
   purpose: "booking" | "wallet_deposit";
@@ -767,6 +836,7 @@ export type VerifyPaymentResponse = Ok<{
   total_amount?: string;
 }>;
 
+
 // ===========================================================================
 // 5. REQUEST BUILDERS (keep quote and create IDENTICAL)
 // ===========================================================================
@@ -797,7 +867,17 @@ export interface TripInput {
   scheduledFor?: Date | string | null;
 }
 
+
 export const coord6 = (n: number): number => Number(n.toFixed(COORD_DECIMALS));
+
+
+/** NaN would be serialised as null and fail on the server with an unhelpful message. */
+function point(p: TripPoint, field: string): { lat: number; lng: number } {
+  const ok = Number.isFinite(p.lat) && Number.isFinite(p.lng) && Math.abs(p.lat) <= 90 && Math.abs(p.lng) <= 180;
+  if (!ok) throw validationError("Please choose a valid location.", field);
+  return { lat: coord6(p.lat), lng: coord6(p.lng) };
+}
+
 
 function validationError(message: string, field?: string): ApiError {
   return new ApiError({
@@ -810,26 +890,29 @@ function validationError(message: string, field?: string): ApiError {
   });
 }
 
+
 function normalizeTrip(trip: TripInput) {
   const service = normalizeServiceKey(trip.service);
   if (!service) throw validationError("Unknown service type.", "service_type");
 
-  const destination = trip.destination ?? (service === "waste-bin" ? trip.pickup : undefined);
+
+  const destination = trip.destination ?? (SERVICE_HINTS[service].requiresDestination ? undefined : trip.pickup);
   if (!destination) throw validationError("A destination is required.", "destination");
+
 
   const stops = (trip.stops ?? []).map((s) => ({
     address: s.address ?? "",
-    lat: coord6(s.lat),
-    lng: coord6(s.lng),
-    wait_minutes: Math.max(0, s.waitMinutes ?? 0),
+    ...point(s, "stops"),
+    wait_minutes: Number.isFinite(s.waitMinutes) ? Math.max(0, s.waitMinutes as number) : 0,
   }));
   return {
     service,
-    pickup: { ...trip.pickup, lat: coord6(trip.pickup.lat), lng: coord6(trip.pickup.lng) },
-    destination: { address: destination.address ?? "", lat: coord6(destination.lat), lng: coord6(destination.lng) },
+    pickup: { address: trip.pickup.address, ...point(trip.pickup, "pickup") },
+    destination: { address: destination.address ?? "", ...point(destination, "destination") },
     stops,
   };
 }
+
 
 /** Body for POST booking/calculate-price/ (booking_serializers.QuoteRequestSerializer). */
 export function toQuoteBody(trip: TripInput) {
@@ -846,12 +929,15 @@ export function toQuoteBody(trip: TripInput) {
   };
 }
 
+
 /** Body for POST booking/create/ (booking_serializers.BookingCreateSerializer). */
 export function toCreateBody(trip: TripInput, quoteToken: string) {
   const t = normalizeTrip(trip);
   const method = normalizePaymentMethod(trip.paymentMethod ?? "cash");
   if (!method) throw validationError("Unsupported payment method.", "payment_method");
-  const scheduled = trip.scheduledFor ? new Date(trip.scheduledFor).toISOString() : null;
+  const when = trip.scheduledFor ? new Date(trip.scheduledFor) : null;
+  if (when && Number.isNaN(when.getTime())) throw validationError("Choose a valid date and time.", "scheduled_for");
+  const scheduled = when ? when.toISOString() : null;
   return {
     quote_token: quoteToken,
     service_type: t.service,
@@ -868,46 +954,142 @@ export function toCreateBody(trip: TripInput, quoteToken: string) {
   };
 }
 
+
 /** Display helper: seconds left on a quote (never used to price anything). */
 export function quoteSecondsLeft(quote: Pick<QuoteResponse, "valid_until">, now: number = Date.now()): number {
-  return Math.max(0, Math.floor((Date.parse(quote.valid_until) - now) / 1000));
+  const left = Math.floor((Date.parse(quote.valid_until) - now) / 1000);
+  return Number.isFinite(left) ? Math.max(0, left) : 0;
 }
 
+
 // ===========================================================================
-// 6. ENDPOINTS
+// 6. RESPONSE NORMALISERS
+// ===========================================================================
+// DRF can send decimals as strings. Convert for display; never invent a price.
+type Raw = Record<string, unknown>;
+
+
+const isRecord = (v: unknown): v is Raw => typeof v === "object" && v !== null && !Array.isArray(v);
+
+
+function badResponse(url: string, raw: unknown): ApiError {
+  return new ApiError({ kind: "bad_response", status: 200, method: "PARSE", url, raw });
+}
+
+
+/** Converts the listed keys to numbers where present. null / missing values are left alone. */
+function numeric<T>(value: T, keys: readonly string[]): T {
+  if (!isRecord(value)) return value;
+  const out: Raw = { ...value };
+  for (const key of keys) {
+    const v = out[key];
+    if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) out[key] = Number(v);
+  }
+  return out as T;
+}
+
+
+const BOOKING_MONEY = ["subtotal", "discount_amount", "total_price"] as const;
+const BREAKDOWN_NUMBERS = [
+  "base_fare", "distance_fare", "subtotal", "surge_amount", "minimum_fare", "ride_fare",
+  "stop_fees", "waiting_charge", "booking_fee", "discount",
+] as const;
+
+
+function parseQuote(raw: unknown): QuoteResponse {
+  if (!isRecord(raw)) throw badResponse(ROUTES.quote, raw);
+  const q = numeric(raw, ["total_price", "distance_km", "price_per_km", "expires_in_seconds"]);
+  if (typeof q.total_price !== "number" || !Number.isFinite(q.total_price) || !isRecord(q.breakdown) || !isRecord(q.surge)) {
+    throw badResponse(ROUTES.quote, raw);
+  }
+  return {
+    ...q,
+    breakdown: numeric(q.breakdown, BREAKDOWN_NUMBERS),
+    surge: numeric(q.surge, ["multiplier"]),
+    quote_token: typeof q.quote_token === "string" && q.quote_token ? q.quote_token : null,
+  } as unknown as QuoteResponse;
+}
+
+
+/** Accepts a bare booking or a {booking: {...}} wrapper. */
+function parseBooking<T extends BookingDetail = BookingDetail>(raw: unknown): T {
+  const data = isRecord(raw) && isRecord(raw.booking) ? raw.booking : raw;
+  if (!isRecord(data) || typeof data.reference !== "string") throw badResponse(ROUTES.bookingList, raw);
+  return numeric(data, BOOKING_MONEY) as unknown as T;
+}
+
+
+/**
+ * The checkout URL to redirect to. Only https is allowed, so a bad response can never
+ * run a "javascript:" URL through window.location.
+ */
+export function paymentRedirectUrl(r: { authorization_url?: string; payment_url?: string }): string {
+  const url = r.authorization_url || r.payment_url || "";
+  if (!/^https:\/\//i.test(url)) throw badResponse(ROUTES.paymentsInitialize, r);
+  return url;
+}
+
+
+// ===========================================================================
+// 7. ENDPOINTS
 // ===========================================================================
 export const api = {
   // ---- health check (use it to tell "proxy/backend unreachable" from "route missing") ----
   health: () => get<{ status: string }>(ROUTES.health, undefined, { auth: false }),
 
+
   // ---- pricing + bookings ------------------------------------------------
   booking: {
     /** POST booking/calculate-price/. Anonymous callers get an estimate with quote_token = null.
      *  Pass `promoCode` here to apply a promo (promos/validate/ is defective, see ROUTES.defective).
-     *  NOTE: the view is AllowAny, but a stale token in the header still returns 401. */
-    quote: (trip: TripInput, o?: { signal?: AbortSignal }) =>
-      post<QuoteResponse>(ROUTES.quote, toQuoteBody(trip), { signal: o?.signal }),
+     *  The view is AllowAny but rejects a stale token with 401, so that case is retried anonymously
+     *  (quote_token is then null: ask the user to sign in before booking). */
+    quote: async (trip: TripInput, o: { signal?: AbortSignal } = {}): Promise<QuoteResponse> => {
+      const body = toQuoteBody(trip);
+      try {
+        return parseQuote(await post<unknown>(ROUTES.quote, body, { signal: o.signal }));
+      } catch (e) {
+        if (!isApiError(e) || e.status !== 401) throw e;
+        return parseQuote(await post<unknown>(ROUTES.quote, body, { signal: o.signal, auth: false }));
+      }
+    },
+
 
     /** POST booking/create/. Replaying the same quote_token returns the existing booking with 200. */
-    create: (trip: TripInput, quoteToken: string) =>
-      post<BookingDetail>(ROUTES.bookingCreate, toCreateBody(trip, quoteToken)),
+    create: async (trip: TripInput, quoteToken: string): Promise<BookingDetail> => {
+      if (!quoteToken) throw validationError("Please get a new price before booking.", "quote_token");
+      return parseBooking(await post<unknown>(ROUTES.bookingCreate, toCreateBody(trip, quoteToken)));
+    },
+
 
     /** GET booking/?status=pending,accepted&page=1&page_size=20 */
-    list: (q: { status?: BookingStatus | BookingStatus[]; page?: number; page_size?: number } = {}) =>
-      get<Paginated<BookingListItem>>(ROUTES.bookingList, q as Query),
+    list: async (
+      q: { status?: BookingStatus | BookingStatus[]; page?: number; page_size?: number } = {},
+      signal?: AbortSignal,
+    ): Promise<Paginated<BookingListItem>> => {
+      const data = await get<Paginated<BookingListItem>>(ROUTES.bookingList, q as Query, { signal });
+      if (!data || !Array.isArray(data.results)) throw badResponse(ROUTES.bookingList, data);
+      return { ...data, results: data.results.map((b) => numeric(b, BOOKING_MONEY)) };
+    },
+
 
     /** GET booking/<ref>/  (shape depends on the caller: customer, rider or staff). */
-    detail: <T extends BookingDetail = BookingDetail>(ref: string) => get<T>(ROUTES.bookingDetail(ref)),
+    detail: async <T extends BookingDetail = BookingDetail>(ref: string, signal?: AbortSignal): Promise<T> =>
+      parseBooking<T>(await get<unknown>(ROUTES.bookingDetail(ref), undefined, { signal })),
 
-    /** PATCH booking/<ref>/status/ . See RIDER_PATCHABLE_STATUSES in config.ts. */
+
+    /** PATCH booking/<ref>/status/ . The backend decides which transitions are allowed. */
     updateStatus: (ref: string, status: BookingStatus, note = "") =>
       patch<RiderBookingDetail>(ROUTES.bookingStatus(ref), { status, note }),
+
 
     /** POST booking/<ref>/cancel/ (a rider "cancelling" releases the job instead). */
     cancel: (ref: string, reason = "") => post<BookingDetail>(ROUTES.bookingCancel(ref), { reason }),
 
+
     /** POST booking/<ref>/release/ (rider gives an accepted job back). */
     release: (ref: string, reason = "") => post<BookingDetail>(ROUTES.bookingRelease(ref), { reason }),
+
 
     /** GET booking/admin/revenue/ (staff). Money values arrive as strings. */
     revenue: (q: { start?: string; end?: string } = {}) =>
@@ -921,11 +1103,16 @@ export const api = {
       }>(ROUTES.revenueReport, q),
   },
 
+
   // ---- riders near a point (availability) ---------------------------------
   riders: {
     /** GET dispatch/rider/nearby/?lat&lng&radius_km&service_type&limit  (login required). */
-    nearby: (q: { lat: number; lng: number; radius_km?: number; service_type?: ServiceKey; limit?: number }, signal?: AbortSignal) =>
-      get<{ count: number; results: NearbyRider[] }>(ROUTES.nearbyRiders, q, { signal }),
+    nearby: async (q: { lat: number; lng: number; radius_km?: number; service_type?: ServiceKey; limit?: number }, signal?: AbortSignal) => {
+      const data = await get<{ count: number; results: NearbyRider[] }>(ROUTES.nearbyRiders, q, { signal });
+      if (!data || !Array.isArray(data.results)) throw badResponse(ROUTES.nearbyRiders, data);
+      return { ...data, results: data.results.map((r) => numeric(r, ["rating", "distance_km", "latitude", "longitude"])) };
+    },
+
 
     /** GET riders/nearby/?lat&lon&service&radius_km&limit  (older search used by the customer app). */
     nearbyLegacy: (q: { lat: number; lon: number; service?: ServiceKey; radius_km?: number; limit?: number }, signal?: AbortSignal) =>
@@ -936,18 +1123,22 @@ export const api = {
       ),
   },
 
+
   // ---- auth ----------------------------------------------------------------
   auth: {
     /** `username` may be the username or the email address. */
     login: (username: string, password: string) =>
       post<Ok<{ token: string; user: LoginUser }>>(ROUTES.login, { username, password }, { auth: false }),
 
+
     /** DRF's own token endpoint. Returns {token}. */
     token: (username: string, password: string) =>
       post<{ token: string }>(ROUTES.tokenAuth, { username, password }, { auth: false }),
 
+
     registerCustomer: (b: { email: string; password: string; full_name?: string; phone?: string; referral_code?: string }) =>
       post<Ok<{ user_id: number; email: string; token: string; user: LoginUser }>>(ROUTES.registerCustomer, b, { auth: false }),
+
 
     registerRider: (b: {
       full_name: string;
@@ -970,11 +1161,14 @@ export const api = {
         }>
       >(ROUTES.registerRider, b, { auth: false }),
 
+
     sendCode: (phone: string) => post<Ok<{ expires_in: number }>>(ROUTES.sendCode, { phone }, { auth: false }),
     verifyCode: (phone: string, code: string) => post<Ok<{ verified: true }>>(ROUTES.verifyCode, { phone, code }, { auth: false }),
 
+
     /** GET auth/me/. Accounts with neither a rider nor a customer profile get 404. */
     me: () => get<Ok<MeRider | MeCustomer>>(ROUTES.me),
+
 
     /** PATCH auth/me/. Customers cannot change full_name (403); phone changes are rejected (400).
      *  Send a FormData when including profile_photo. */
@@ -982,6 +1176,7 @@ export const api = {
       b instanceof FormData
         ? request<Ok<MeRider | MeCustomer>>("PATCH", ROUTES.me, { form: b })
         : patch<Ok<MeRider | MeCustomer>>(ROUTES.me, b),
+
 
     /** POST auth/rider/verify/ (multipart). One document per call. */
     uploadRiderDocument: (b: { document_type: DocumentType; file: File; expiry_date?: string }) => {
@@ -1000,6 +1195,7 @@ export const api = {
       >("POST", ROUTES.riderDocuments, { form });
     },
 
+
     riderVerificationStatus: () =>
       get<
         Ok<{
@@ -1011,6 +1207,7 @@ export const api = {
       >(ROUTES.riderVerificationStatus),
   },
 
+
   // ---- customer ------------------------------------------------------------
   customer: {
     profile: () => get<Ok<{ data: CustomerProfile }>>(ROUTES.customerProfile),
@@ -1019,6 +1216,7 @@ export const api = {
       b instanceof FormData
         ? request<Ok<{ data: CustomerProfile }>>("PATCH", ROUTES.customerProfile, { form: b })
         : patch<Ok<{ data: CustomerProfile }>>(ROUTES.customerProfile, b),
+
 
     /** GET customer/wallet  (no trailing slash, on purpose). */
     wallet: () =>
@@ -1033,6 +1231,7 @@ export const api = {
         }>
       >(ROUTES.customerWallet),
   },
+
 
   // ---- rider ---------------------------------------------------------------
   rider: {
@@ -1049,6 +1248,7 @@ export const api = {
         }>
       >(ROUTES.riderWallet),
 
+
     /** Paginated; also returns summary, monthly_trend and insights. CSV export is ?export=csv (use a plain link). */
     transactions: (q: TransactionQuery = {}) =>
       get<
@@ -1062,14 +1262,18 @@ export const api = {
           }>
       >(ROUTES.riderTransactions, q),
 
+
     /** POST rider/deposit/. Returns the Paystack checkout URL; the wallet is credited only after payment verifies. */
     deposit: (amount: number | string) => post<InitializePaymentResponse>(ROUTES.riderDeposit, { amount }),
+
 
     deposits: (q: { page?: number; page_size?: number } = {}) =>
       get<Paginated<RiderWalletTx> & Ok>(ROUTES.riderDeposits, q),
 
+
     /** GET rider/deposits/<reference>/verify/ . 202 = still pending: poll again. */
     verifyDeposit: (reference: string) => get<VerifyPaymentResponse>(ROUTES.riderDepositVerify(reference)),
+
 
     /** POST rider/withdraw/ . Send an idempotency key so a double tap cannot withdraw twice. */
     withdraw: (b: { amount: number | string; payout_account_id?: number }, idempotencyKey?: string) =>
@@ -1079,13 +1283,16 @@ export const api = {
         { idempotencyKey },
       ),
 
+
     /** PATCH rider/update-location/ */
     updateLocation: (b: { latitude: number; longitude: number; speed_kmh?: number | null; heading?: number | null }) =>
       patch<Ok<{ latitude: number; longitude: number; updated_at: string }>>(ROUTES.riderLocation, b),
 
+
     acceptOffer: (offerId: string) => post<Ok>(ROUTES.offerAccept(offerId)),
     declineOffer: (offerId: string, reason = "") => post<Ok>(ROUTES.offerDecline(offerId), { reason }),
   },
+
 
   // ---- payments (Paystack) ---------------------------------------------------
   payments: {
@@ -1096,5 +1303,7 @@ export const api = {
   },
 };
 
+
 export type Api = typeof api;
+
 

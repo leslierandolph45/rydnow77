@@ -1,83 +1,205 @@
 // lib/rydnow/session.ts
-// Small helpers shared by the customer dashboard: session clearing, safe localStorage,
-// and a fetch wrapper for non-booking endpoints (profile, phone verification).
-// Everything goes through the same Next.js proxy as lib/rydnow/api.ts.
 
-import { getToken } from "./api";
 
-const BASE = process.env.NEXT_PUBLIC_RYDNOW_API_BASE ?? "/api/rydnow";
-const AUTH_SCHEME = process.env.NEXT_PUBLIC_RYDNOW_AUTH_SCHEME ?? "Token";
-const TOKEN_KEY = process.env.NEXT_PUBLIC_RYDNOW_TOKEN_KEY ?? "rydnow_token";
+/**
+ * Typed, SSR-safe wrapper around localStorage for Rydnow session data.
+ *
+ * - Never throws: storage can be missing (SSR), blocked (private mode,
+ *   cookie settings) or full (quota), so every call fails soft.
+ * - All keys are namespaced with STORAGE_PREFIX so clearSession() only
+ *   removes Rydnow data.
+ * - The auth token is stored as a plain string under "rydnow_token" so the
+ *   login page and both dashboards read the same value. localStorage is
+ *   readable by any script on the page, so move to an httpOnly cookie
+ *   before production.
+ */
 
-export function clearSession(): void {
+
+const STORAGE_PREFIX = 'rydnow_';
+const TOKEN_KEY = 'token'; // stored as "rydnow_token"
+const LEGACY_KEYS = ['authtoken', 'currentUser']; // older keys the login page also writes
+
+
+type Validator<T> = (value: unknown) => value is T;
+
+
+const prefixed = (key: string): string => `${STORAGE_PREFIX}${key}`;
+
+
+/** Returns localStorage, or null when unavailable (SSR or access blocked). */
+function getStorage(): Storage | null {
+  if (typeof window === 'undefined') return null;
   try {
-    for (const key of [TOKEN_KEY, "rydnow_username", "authToken", "currentUser", "rydnow_profile"]) {
-      localStorage.removeItem(key);
+    return window.localStorage;
+  } catch {
+    // Accessing localStorage can throw a SecurityError when blocked.
+    return null;
+  }
+}
+
+
+/** Reads and parses a stored JSON value. Returns null if missing or corrupt. */
+export function readJSON<T>(key: string, validate?: Validator<T>): T | null {
+  const storage = getStorage();
+  if (!storage) return null;
+
+
+  try {
+    const raw = storage.getItem(prefixed(key));
+    if (raw === null) return null;
+
+
+    const parsed: unknown = JSON.parse(raw);
+    if (validate && !validate(parsed)) {
+      storage.removeItem(prefixed(key));
+      return null;
     }
-  } catch {
-    /* storage unavailable */
+    return parsed as T;
+  } catch (error) {
+    if (error instanceof SyntaxError) {
+      try {
+        storage.removeItem(prefixed(key));
+      } catch {
+        /* ignore */
+      }
+    }
+    return null;
   }
 }
 
-export function readJSON<T>(key: string, fallback: T): T {
-  try {
-    const raw = localStorage.getItem(key);
-    return raw ? (JSON.parse(raw) as T) : fallback;
-  } catch {
-    return fallback;
-  }
-}
 
-export function writeJSON(key: string, value: unknown): boolean {
+/** Serialises and stores a value. Returns true on success. */
+export function writeJSON<T>(key: string, value: T): boolean {
+  const storage = getStorage();
+  if (!storage) return false;
+
+
   try {
-    localStorage.setItem(key, JSON.stringify(value));
+    const serialised = JSON.stringify(value);
+    if (serialised === undefined) return false;
+    storage.setItem(prefixed(key), serialised);
     return true;
   } catch {
     return false;
   }
 }
 
-export interface AuthResponse {
-  ok: boolean;
-  status: number; // 0 = network failure
-  data: unknown;
-}
 
-export async function authFetch(
-  path: string,
-  init: { method?: string; body?: unknown } = {},
-): Promise<AuthResponse> {
+/** Reads a plain (non-JSON) string value. */
+export function readString(key: string): string | null {
+  const storage = getStorage();
+  if (!storage) return null;
   try {
-    const token = getToken();
-    const res = await fetch(`${BASE}/${path}`, {
-      method: init.method ?? "GET",
-      cache: "no-store",
-      headers: {
-        Accept: "application/json",
-        ...(init.body !== undefined ? { "Content-Type": "application/json" } : {}),
-        ...(token ? { Authorization: `${AUTH_SCHEME} ${token}` } : {}),
-      },
-      body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
-    });
-    const text = await res.text();
-    let data: unknown = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = null;
-    }
-    return { ok: res.ok, status: res.status, data };
+    return storage.getItem(prefixed(key));
   } catch {
-    return { ok: false, status: 0, data: null };
+    return null;
   }
 }
 
-/** Pulls a human message out of a DRF-style error body. */
-export function messageFrom(data: unknown): string {
-  if (!data || typeof data !== "object") return "";
-  const o = data as Record<string, unknown>;
-  if (typeof o.detail === "string") return o.detail;
-  if (typeof o.message === "string") return o.message;
-  if (Array.isArray(o.phone) && o.phone.length) return String(o.phone[0]);
-  return "";
+
+/** Stores a plain (non-JSON) string value. Returns true on success. */
+export function writeString(key: string, value: string): boolean {
+  const storage = getStorage();
+  if (!storage) return false;
+  try {
+    storage.setItem(prefixed(key), value);
+    return true;
+  } catch {
+    return false;
+  }
 }
+
+
+/** Removes a single Rydnow key. */
+export function removeItem(key: string): void {
+  const storage = getStorage();
+  if (!storage) return;
+  try {
+    storage.removeItem(prefixed(key));
+  } catch {
+    /* ignore */
+  }
+}
+
+
+// ─── AUTH TOKEN ──────────────────────────────────────────────────
+
+
+/** Returns the saved auth token, or null if signed out / storage unavailable. */
+export function getAuthToken(): string | null {
+  const token = readString(TOKEN_KEY);
+  return token && token.trim() ? token : null;
+}
+
+
+/** Saves the auth token (also writes the legacy "authtoken" key). */
+export function setAuthToken(token: string): boolean {
+  const storage = getStorage();
+  if (storage) {
+    try {
+      storage.setItem('authtoken', token);
+    } catch {
+      /* ignore */
+    }
+  }
+  return writeString(TOKEN_KEY, token);
+}
+
+
+/** Removes the auth token and the legacy keys. */
+export function clearAuthToken(): void {
+  removeItem(TOKEN_KEY);
+  const storage = getStorage();
+  if (!storage) return;
+  try {
+    LEGACY_KEYS.forEach((k) => storage.removeItem(k));
+  } catch {
+    /* ignore */
+  }
+}
+
+
+/** Removes every Rydnow key, leaving other apps' data on the origin alone. */
+export function clearSession(): void {
+  const storage = getStorage();
+  if (!storage) return;
+
+
+  try {
+    // Collect first: removing while iterating by index would skip entries.
+    const keys: string[] = [];
+    for (let i = 0; i < storage.length; i++) {
+      const k = storage.key(i);
+      if (k && k.startsWith(STORAGE_PREFIX)) keys.push(k);
+    }
+    keys.forEach((k) => storage.removeItem(k));
+    LEGACY_KEYS.forEach((k) => storage.removeItem(k));
+  } catch {
+    /* ignore */
+  }
+}
+
+
+/**
+ * Calls `callback` when another tab changes or clears a Rydnow key, which is
+ * useful for logging out in every tab at once. `key` is the unprefixed key,
+ * or null when storage was cleared. Returns an unsubscribe function.
+ */
+export function subscribe(callback: (key: string | null) => void): () => void {
+  if (typeof window === 'undefined') return () => undefined;
+
+
+  const handler = (event: StorageEvent) => {
+    if (event.key === null) {
+      callback(null);
+    } else if (event.key.startsWith(STORAGE_PREFIX)) {
+      callback(event.key.slice(STORAGE_PREFIX.length));
+    }
+  };
+
+
+  window.addEventListener('storage', handler);
+  return () => window.removeEventListener('storage', handler);
+}
+
+

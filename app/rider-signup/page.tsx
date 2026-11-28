@@ -1,8 +1,11 @@
 'use client'
-import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react'
+
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent, type InputHTMLAttributes, type ReactNode } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
+import { RiderShell, ErrorNote } from '@/components/rider/RiderShell'
 
+/* ───────────── Config ───────────── */
 
 const API_BASE = (
   process.env.NEXT_PUBLIC_API_URL ||
@@ -18,6 +21,12 @@ const SLOW_NOTICE_MS = 5000
 const TOKEN_KEY = 'authToken'
 const RIDER_KEY = 'riderId'
 
+/** Logs backend payloads while developing only. Never log responses in production (they can hold tokens). */
+const debug = (...args: unknown[]) => {
+  if (process.env.NODE_ENV !== 'production') console.debug(...args)
+}
+
+/* ───────────── Field ───────────── */
 
 type FieldProps = {
   label: string
@@ -28,10 +37,12 @@ type FieldProps = {
   onChange: (e: ChangeEvent<HTMLInputElement>) => void
   autoComplete?: string
   hint?: string
+  inputMode?: InputHTMLAttributes<HTMLInputElement>['inputMode']
+  autoCapitalize?: string
+  extra?: ReactNode
 }
 
-
-function Field({ label, name, type = 'text', value, placeholder, onChange, autoComplete, hint }: FieldProps) {
+function Field({ label, name, type = 'text', value, placeholder, onChange, autoComplete, hint, inputMode, autoCapitalize, extra }: FieldProps) {
   const [show, setShow] = useState(false)
   const isPassword = type === 'password'
   return (
@@ -47,20 +58,52 @@ function Field({ label, name, type = 'text', value, placeholder, onChange, autoC
           required
           placeholder={placeholder}
           autoComplete={autoComplete}
+          inputMode={inputMode}
+          autoCapitalize={autoCapitalize}
+          spellCheck={false}
         />
         {isPassword && (
-          <button type="button" className="rn-eye" onClick={() => setShow(s => !s)} aria-label={show ? 'Hide password' : 'Show password'}>
+          <button
+            type="button"
+            className="rn-eye"
+            onClick={() => setShow(s => !s)}
+            aria-label={show ? 'Hide password' : 'Show password'}
+            aria-pressed={show}
+          >
             {show ? 'Hide' : 'Show'}
           </button>
         )}
       </div>
       {hint && <small>{hint}</small>}
+      {extra}
     </div>
   )
 }
 
+/** Visual hint only. The real rule (8+ characters) is enforced in handleSubmit and by the backend. */
+function PasswordMeter({ password }: { password: string }) {
+  if (!password) return null
+  let score = 0
+  if (password.length >= 8) score++
+  if (password.length >= 12) score++
+  if (/[a-z]/.test(password) && /[A-Z]/.test(password)) score++
+  if (/\d/.test(password) || /[^A-Za-z0-9]/.test(password)) score++
+  if (password.length < 8) score = 0
+  const labels = ['Use at least 8 characters', 'Weak', 'Okay', 'Good', 'Strong']
+  return (
+    <>
+      <div className="rn-meter" aria-hidden="true">
+        {[1, 2, 3, 4].map(i => (
+          <i key={i} className={score >= i ? 'on' : ''} />
+        ))}
+      </div>
+      <div className="rn-meter-tx" aria-live="polite">{labels[score]}</div>
+    </>
+  )
+}
 
-// ─── helpers ──────────────────────────────────────────────────────────────────
+/* ───────────── Helpers ───────────── */
+
 const FIELD_LABELS: Record<string, string> = {
   full_name: 'Full name',
   email: 'Email',
@@ -110,7 +153,6 @@ function extractError(data: unknown, fallback: string): string {
   return fallback
 }
 
-
 /** Reads the first string found under any of the given keys (supports nested {rider:{id}} / {data:{...}}). */
 function pick(data: unknown, keys: string[]): string | null {
   if (!data || typeof data !== 'object') return null
@@ -127,7 +169,6 @@ function pick(data: unknown, keys: string[]): string | null {
   return null
 }
 
-
 function safeStore(storage: Storage, key: string, value: string) {
   try {
     storage.setItem(key, value)
@@ -136,10 +177,10 @@ function safeStore(storage: Storage, key: string, value: string) {
   }
 }
 
+/* ───────────── Page ───────────── */
 
 export default function RiderSignupPage() {
   const router = useRouter()
-
 
   const [formData, setFormData] = useState({
     fullName: '',
@@ -148,7 +189,7 @@ export default function RiderSignupPage() {
     password: '',
     confirmPassword: '',
     motorbikeModel: '',
-    licenseNumber: ''
+    licenseNumber: '',
   })
   const [agreed, setAgreed] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
@@ -156,12 +197,10 @@ export default function RiderSignupPage() {
   const [error, setError] = useState('')
   const inFlight = useRef(false) // blocks double-taps before state updates
 
-
   // Warm up the next page so the redirect feels instant.
   useEffect(() => {
     router.prefetch(VERIFY_PATH)
   }, [router])
-
 
   const handleChange = (e: ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target
@@ -169,12 +208,10 @@ export default function RiderSignupPage() {
     setError('')
   }
 
-
   const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (inFlight.current) return
     setError('')
-
 
     // Client-side checks
     if (formData.password.length < 8) {
@@ -190,14 +227,12 @@ export default function RiderSignupPage() {
       return
     }
 
-
     inFlight.current = true
     setIsSubmitting(true)
     const slowTimer = setTimeout(() => setSlow(true), SLOW_NOTICE_MS)
     const controller = new AbortController()
     const abortTimer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
     let success = false
-
 
     try {
       // Step 1: register the rider
@@ -215,14 +250,11 @@ export default function RiderSignupPage() {
         }),
       })
 
-
       // The API must answer with JSON. HTML means a proxy/server error page (wrong URL, crash, cold start).
       const isJson = (res.headers.get('content-type') || '').includes('application/json')
       const data: unknown = isJson ? await res.json().catch(() => null) : null
 
-      // Shows the exact backend payload in DevTools > Console while you debug.
-      console.error('Register response', res.status, data)
-
+      debug('Register response', res.status, data)
 
       if (!res.ok) {
         if (!isJson) {
@@ -235,14 +267,13 @@ export default function RiderSignupPage() {
         throw new Error(extractError(data, 'Registration failed. Please check your details and try again.'))
       }
 
-
       // Registration succeeded: keep what the verification page needs.
       const riderId = pick(data, ['rider_id', 'id', 'pk'])
       const token = pick(data, ['token', 'key', 'access', 'access_token'])
 
       if (!token) {
         // The verification page needs this token to upload documents.
-        console.error('Registration succeeded but the response had no token:', data)
+        debug('Registration succeeded but the response had no token:', data)
         throw new Error(
           'Your account was created, but we could not start verification automatically. Please sign in to continue.'
         )
@@ -256,7 +287,6 @@ export default function RiderSignupPage() {
         safeStore(localStorage, RIDER_KEY, riderId)
       }
 
-
       // Never store the password.
       const safeData = {
         fullName: formData.fullName,
@@ -267,12 +297,11 @@ export default function RiderSignupPage() {
       }
       safeStore(sessionStorage, 'riderSignupData', JSON.stringify(safeData))
 
-
       // Step 2: continue to document verification
       success = true
       router.push(VERIFY_PATH)
     } catch (err) {
-      console.error('Rider signup error:', err)
+      debug('Rider signup error:', err)
       if (err instanceof DOMException && err.name === 'AbortError') {
         setError('The server is taking too long to respond. Please try again in a minute.')
       } else if (err instanceof TypeError) {
@@ -291,104 +320,55 @@ export default function RiderSignupPage() {
     }
   }
 
-
   return (
-    <div className="rn-page">
-      <style>{css}</style>
+    <RiderShell
+      step={1}
+      headline="Your bike. Your hours. Your road."
+      lead="Create your rider account in about two minutes, then verify once and start taking jobs."
+      backHref="/"
+    >
+      <section className="rn-sheet">
+        <h2>Create your rider account</h2>
+        <p className="rn-sheet-sub">Step 1 of 3. Tell us who you are and what you ride.</p>
 
-
-      <header className="rn-nav">
-        <Link href="/" className="rn-logo">RYD<b>NOW</b></Link>
-        <Link href="/" className="rn-back">← Back</Link>
-      </header>
-
-
-      <main className="rn-wrap">
-        <span className="rn-eyebrow">Rider signup</span>
-        <h1>Become a Rider</h1>
-        <p className="rn-sub">Join RYDNOW and start earning today.</p>
-
-
-        <div className="rn-steps" aria-label="Progress">
-          <span className="on">1 Details</span>
-          <span>2 Verification</span>
-          <span>3 Start riding</span>
-        </div>
-
-
-        {error && <div className="rn-error" role="alert">{error}</div>}
-
+        <ErrorNote message={error} />
 
         <form onSubmit={handleSubmit} className="rn-form">
-          <Field label="Full name" name="fullName" value={formData.fullName} onChange={handleChange} placeholder="Your full name" autoComplete="name" />
-          <Field label="Email address" name="email" type="email" value={formData.email} onChange={handleChange} placeholder="your@email.com" autoComplete="email" />
-          <Field label="Phone number" name="phone" type="tel" value={formData.phone} onChange={handleChange} placeholder="+233 XX XXX XXXX" autoComplete="tel" />
-          <Field label="Password" name="password" type="password" value={formData.password} onChange={handleChange} placeholder="Create a strong password" autoComplete="new-password" hint="At least 8 characters." />
+          <Field label="Full name" name="fullName" value={formData.fullName} onChange={handleChange} placeholder="Your full name" autoComplete="name" autoCapitalize="words" />
+          <Field label="Email address" name="email" type="email" value={formData.email} onChange={handleChange} placeholder="your@email.com" autoComplete="email" inputMode="email" autoCapitalize="none" />
+          <Field label="Phone number" name="phone" type="tel" value={formData.phone} onChange={handleChange} placeholder="+233 XX XXX XXXX" autoComplete="tel" inputMode="tel" />
+          <Field
+            label="Password"
+            name="password"
+            type="password"
+            value={formData.password}
+            onChange={handleChange}
+            placeholder="Create a strong password"
+            autoComplete="new-password"
+            hint="At least 8 characters."
+            extra={<PasswordMeter password={formData.password} />}
+          />
           <Field label="Confirm password" name="confirmPassword" type="password" value={formData.confirmPassword} onChange={handleChange} placeholder="Re-enter your password" autoComplete="new-password" />
-
 
           <div className="rn-divider"><span>Your motorbike</span></div>
 
-
-          <Field label="Motorbike model" name="motorbikeModel" value={formData.motorbikeModel} onChange={handleChange} placeholder="e.g. Honda CG 125" />
-          <Field label="Motor vehicle license no." name="licenseNumber" value={formData.licenseNumber} onChange={handleChange} placeholder="Your license number" />
-
+          <Field label="Motorbike model" name="motorbikeModel" value={formData.motorbikeModel} onChange={handleChange} placeholder="e.g. Honda CG 125" autoCapitalize="words" />
+          <Field label="Motor vehicle license no." name="licenseNumber" value={formData.licenseNumber} onChange={handleChange} placeholder="Your license number" autoComplete="off" autoCapitalize="characters" />
 
           <label className="rn-check">
             <input type="checkbox" checked={agreed} onChange={e => { setAgreed(e.target.checked); setError('') }} />
-            <span>I agree to the <Link href="/terms">Terms & Conditions</Link> and <Link href="/privacy">Privacy Policy</Link></span>
+            <span>I agree to the <Link href="/terms">Terms &amp; Conditions</Link> and <Link href="/privacy">Privacy Policy</Link></span>
           </label>
 
-
           <button type="submit" disabled={isSubmitting} className="rn-submit">
-            {isSubmitting ? 'Please wait...' : 'Continue →'}
+            {isSubmitting ? 'Creating your account…' : 'Continue to verification'}
           </button>
           {slow && <p className="rn-signin" role="status">Waking up the server… this can take up to a minute.</p>}
 
-
           <p className="rn-signin">Already a rider? <Link href="/login">Sign in</Link></p>
         </form>
-      </main>
-    </div>
+      </section>
+    </RiderShell>
   )
 }
-
-
-const css =
-`
-.rn-page{--bg:#fff;--ink:#0B1540;--muted:#5B6385;--line:#E3E6F0;--field:#F2F4FA;--blue:#1E3FCE;--gold:#F5B82E;
-  min-height:100dvh;background:var(--bg);color:var(--ink);font-family:Inter,-apple-system,"Segoe UI",Roboto,system-ui,sans-serif;line-height:1.5}
-@media(prefers-color-scheme:dark){.rn-page{--bg:#0A0F2B;--ink:#fff;--muted:#A5ACCB;--line:#232B57;--field:#151C42}}
-.rn-page *{box-sizing:border-box}
-.rn-nav{display:flex;justify-content:space-between;align-items:center;padding:18px 24px;border-bottom:1px solid var(--line)}
-.rn-logo{font-weight:900;font-style:italic;font-size:24px;letter-spacing:-.5px;color:var(--ink);text-decoration:none}
-.rn-logo b{color:var(--gold)}
-.rn-back{color:var(--muted);text-decoration:none;font-size:14px;font-weight:600}
-.rn-wrap{max-width:440px;margin:0 auto;padding:36px 24px 56px}
-.rn-eyebrow{display:inline-block;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--blue);margin-bottom:8px}
-.rn-wrap h1{font-size:34px;line-height:1.1;letter-spacing:-.03em;font-weight:800;margin:0 0 6px}
-.rn-sub{color:var(--muted);margin:0 0 20px}
-.rn-steps{display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap}
-.rn-steps span{font-size:12px;font-weight:600;padding:6px 12px;border-radius:999px;background:var(--field);color:var(--muted)}
-.rn-steps span.on{background:var(--ink);color:var(--bg)}
-.rn-error{background:#FDECEC;border:1px solid #F5B5B5;color:#B42318;padding:12px 16px;border-radius:10px;margin-bottom:20px;font-size:14px}
-@media(prefers-color-scheme:dark){.rn-error{background:#3A1216;border-color:#7F1D1D;color:#FCA5A5}}
-.rn-form{display:flex;flex-direction:column;gap:16px}
-.rn-field label{display:block;font-size:14px;font-weight:600;margin-bottom:6px}
-.rn-input{display:flex;align-items:center;background:var(--field);border:2px solid transparent;border-radius:10px;padding:0 14px}
-.rn-input:focus-within{border-color:var(--blue);background:var(--bg)}
-.rn-input input{flex:1;min-width:0;border:0;outline:0;background:transparent;color:var(--ink);font:inherit;font-size:16px;padding:15px 0}
-.rn-input input::placeholder{color:var(--muted)}
-.rn-eye{border:0;background:transparent;color:var(--blue);font-weight:700;font-size:13px;cursor:pointer;padding:6px}
-.rn-field small{display:block;margin-top:4px;color:var(--muted);font-size:12px}
-.rn-divider{display:flex;align-items:center;gap:12px;color:var(--muted);font-size:13px;font-weight:600;margin-top:4px}
-.rn-divider:before,.rn-divider:after{content:"";flex:1;height:1px;background:var(--line)}
-.rn-check{display:flex;gap:10px;align-items:flex-start;font-size:14px;color:var(--muted);cursor:pointer}
-.rn-check input{margin-top:3px;width:18px;height:18px;accent-color:var(--blue)}
-.rn-check a{color:var(--blue);font-weight:600;text-decoration:none}
-.rn-submit{margin-top:4px;padding:16px;background:var(--blue);color:#fff;border:0;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;font-family:inherit}
-.rn-submit:disabled{opacity:.7;cursor:not-allowed}
-.rn-signin{text-align:center;color:var(--muted);font-size:14px;margin:4px 0 0}
-.rn-signin a{color:var(--blue);font-weight:700;text-decoration:none}
-`
 

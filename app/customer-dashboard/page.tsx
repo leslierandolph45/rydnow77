@@ -1,5 +1,6 @@
 'use client';
 
+
 /**
  * RYDNOW customer dashboard (single file).
  *
@@ -14,19 +15,20 @@
  *   2. Pure helpers
  *   3. Small presentational components
  *   4. Larger UI sections
- *   5. Data hooks (toast, quote, nearby riders, bookings)
+ *   5. Data hooks (toast, quote, nearby riders, bookings, online status)
  *   6. CustomerDashboard (default export)
  */
+
 
 import Image from 'next/image';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 
+
 import {
   api,
   friendlyError,
-  getToken,
   isAbort,
   isApiError,
   needsNewQuote,
@@ -58,9 +60,12 @@ import {
   type ServiceKey,
 } from '@/lib/rydnow/config';
 import { currentPosition, reversePlace, searchPlaces } from '@/lib/rydnow/geocode';
+// FIX: the token helpers live in session.ts (getToken was not exported from api.ts)
+import { clearSession, getAuthToken } from '@/lib/rydnow/session';
 
-import AccountTab from '@/app/components/dashboard/account-tab';
-import ActivityTab, { cancelMessage, isActive, statusUi } from '@/app/components/dashboard/activity-tab';
+
+import AccountTab from '@/components/dashboard/AccountTab';
+import ActivityTab, { cancelMessage, isActive, statusUi } from '@/components/dashboard/ActivityTab';
 import {
   SAVED_PLACE_META,
   useCountdown,
@@ -68,39 +73,68 @@ import {
   usePlaces,
   useProfile,
   type SavedPlaceId,
-} from '@/app/components/dashboard/hooks';
-import PlaceField from '@/app/components/dashboard/PlaceField';
-import { RiderMap, useRouteLine, type LatLng, type MapRider } from '@/app/components/dashboard/RiderMap';
-import { clearSession, readJSON } from '@/lib/rydnow/session';
+} from '@/lib/rydnow/hooks';
+import PlaceField from '@/components/PlaceField';
+import { RiderMap, useRouteLine, type LatLng, type MapRider } from '@/components/RiderMap';
 import {
   ConfirmDialog,
   Icon,
   RouteSummary,
-  SERVICE_ICON,
   Sheet,
   Spinner,
   inputCls,
   type ConfirmState,
   type ToastType,
-} from '@/app/components/dashboard/ui';
+} from '@/components/dashboard/ui';
+
 
 // ═══ 1. SETTINGS, TYPES, CONSTANTS ═══
+
 
 // ─── Settings: edit anytime ───
 const REFERRAL_REWARD = 10; // ₵ off for the friend AND the inviter
 const REFERRAL_PATH = '/signup'; // page that reads ?ref=CODE
 const DEFAULT_CENTER: LatLng = { lat: 5.6037, lng: -0.187 }; // Accra
 
+
+const SUPPORT = {
+  phoneLabel: '+233 59 411 6155',
+  phoneHref: 'tel:+233594116155',
+  whatsappHref: 'https://wa.me/233594116155',
+  email: 'support@rydnow.app',
+} as const;
+
+
+// Ghana emergency numbers
+const EMERGENCY = [
+  { label: 'Emergency (all services)', number: '112', icon: '🚨' },
+  { label: 'Police', number: '191', icon: '👮' },
+  { label: 'Ambulance', number: '193', icon: '🚑' },
+  { label: 'Fire service', number: '192', icon: '🚒' },
+] as const;
+
+
+// Service icons live in /public
+const SERVICE_ICON_SRC: Record<ServiceKey, string> = {
+  okada: '/Bike.png',
+  parcel: '/Delivery rider.jpeg',
+  'waste-bin': '/Bin collector.jpeg',
+};
+
+
 // ─── Timings ───
 const QUOTE_DEBOUNCE_MS = 450;
 const BOOKING_POLL_MS = 5_000;
 const MIN_SCHEDULE_LEAD_MS = 15 * 60 * 1000;
 
+
 // Circumference of the price-lock countdown ring (r = 24).
 const RING = 2 * Math.PI * 24;
 
+
 // ─── Types ───
 type Tab = 'home' | 'activity' | 'account';
+
 
 /** Display wording for a service. Static copy only: the backend does not send it. */
 interface ServiceUi {
@@ -115,8 +149,10 @@ interface ServiceUi {
   notesPlaceholder: string;
 }
 
+
 /** Everything the page needs to know about the selected service: wording + backend limits. */
 type ServiceView = ServiceUi & ServiceHints;
+
 
 /** A quote plus the client-side clock values the price-lock countdown needs. */
 interface LiveQuote {
@@ -125,11 +161,13 @@ interface LiveQuote {
   expiresAtMs: number;
 }
 
+
 interface StopDraft {
   id: string;
   place: Place | null;
   wait: number;
 }
+
 
 interface ParcelDraft {
   category: string;
@@ -138,10 +176,12 @@ interface ParcelDraft {
   item: string;
 }
 
+
 interface WasteDraft {
   type: string;
   bins: string;
 }
+
 
 interface OptionItem {
   id: string;
@@ -149,8 +189,10 @@ interface OptionItem {
   desc: string;
 }
 
+
 const EMPTY_PARCEL: ParcelDraft = { category: '', recipientName: '', recipientPhone: '', item: '' };
 const EMPTY_WASTE: WasteDraft = { type: '', bins: '' };
+
 
 // ─── Static option lists ───
 const SERVICE_UI: Record<ServiceKey, ServiceUi> = {
@@ -186,12 +228,14 @@ const SERVICE_UI: Record<ServiceKey, ServiceUi> = {
   },
 };
 
+
 const DELIVERY_CATEGORIES: readonly OptionItem[] = [
   { id: 'Food', label: '🍔 Food delivery', desc: 'Hot meals & restaurant orders' },
   { id: 'Parcel', label: '📦 Parcel delivery', desc: 'Packages & items' },
   { id: 'Documents', label: '📄 Documents', desc: 'Letters & important papers' },
   { id: 'Other', label: '🎁 Other', desc: 'Anything else that needs delivering' },
 ];
+
 
 const WASTE_TYPES: readonly OptionItem[] = [
   { id: 'Household waste', label: '🏠 Household waste', desc: 'General home rubbish' },
@@ -200,7 +244,9 @@ const WASTE_TYPES: readonly OptionItem[] = [
   { id: 'Garden waste', label: '🌿 Garden waste', desc: 'Leaves, branches & grass' },
 ];
 
+
 const PAY_ICON: Record<PaymentMethod, string> = { cash: '💵', momo: '📱', card: '💳', wallet: '👛' };
+
 
 const PAY_HINT: Record<PaymentMethod, string> = {
   cash: 'Pay your rider at the end of the trip',
@@ -209,35 +255,48 @@ const PAY_HINT: Record<PaymentMethod, string> = {
   wallet: 'Use your RYDNOW balance',
 };
 
+
 // ═══ 2. HELPERS ═══
+
 
 /** Pure helpers. No React, no browser-only globals at import time. */
 
+
 // FIX: template literals had lost their "${ }" and printed raw text.
 const uid = () =>
-  typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`;
+  typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
 
 const mmss = (seconds: number) => `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 
+
 const cleanPhone = (value: string) => value.replace(/[\s\-()]/g, '');
+
 
 const isGhPhone = (value: string) => /^(\+233|233|0)\d{9}$/.test(cleanPhone(value));
 
+
 const capitalise = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
+
 
 /** Rough ETA at ~20 km/h in town traffic. */
 const etaMinutes = (km: number) => Math.max(2, Math.round((km / 20) * 60) + 1);
+
 
 function greetingFor(date = new Date()) {
   const h = date.getHours();
   return h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
 }
 
+
 /** Value for <input type="datetime-local"> in the user's local time. */
 function localInputValue(d: Date) {
   const p = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
 }
+
 
 /** Fallback only. Prefer a server-issued code (currentUser.referral_code): this hash can collide and is guessable. */
 function makeReferralCode(seed: string) {
@@ -246,12 +305,26 @@ function makeReferralCode(seed: string) {
   return `RYD-${h.toString(36).toUpperCase().padStart(5, '0').slice(-5)}`;
 }
 
+
+/** The login page saves the user object as plain JSON under "currentUser". */
+function readStoredUser(): Record<string, unknown> {
+  try {
+    const raw = localStorage.getItem('currentUser');
+    const parsed: unknown = raw ? JSON.parse(raw) : null;
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+
 /** Wrap a quote with the local clock values the countdown needs. Uses the server's lifetime, not its clock. */
 function toLiveQuote(quote: Quote): LiveQuote {
   const receivedAtMs = Date.now();
   const ttl = quote.expires_in_seconds > 0 ? quote.expires_in_seconds : QUOTE_FALLBACK_TTL_SECONDS;
   return { quote, receivedAtMs, expiresAtMs: receivedAtMs + ttl * 1000 };
 }
+
 
 /** Rows for the price breakdown, exactly as the backend itemised them. Display only. */
 function priceLines(b: QuoteBreakdown): { label: string; amount: number }[] {
@@ -264,6 +337,7 @@ function priceLines(b: QuoteBreakdown): { label: string; amount: number }[] {
   if (b.discount > 0) rows.push({ label: b.promo_code ? `Promo ${b.promo_code}` : 'Discount', amount: -b.discount });
   return rows;
 }
+
 
 /** GET booking/ returns summaries only. Used when a booking's full detail could not be loaded. */
 function fromListItem(item: BookingListItem): Booking {
@@ -286,9 +360,27 @@ function fromListItem(item: BookingListItem): Booking {
   };
 }
 
+
 const vehicleLabel = (v: NearbyRider['vehicle']) => [v?.color, v?.model].filter(Boolean).join(' ');
 
+
+/** Rider phone, if the backend included one. Field names vary, so read defensively. */
+function riderPhoneOf(b: Booking): string {
+  const r = b.rider as unknown as { phone?: string; phone_number?: string } | null;
+  return (r?.phone || r?.phone_number || '').trim();
+}
+
+
+/** Plain-text trip summary a customer can send to family or friends. */
+function tripShareText(b: Booking): string {
+  const lines = [`I’m on a Rydnow trip (${b.reference}).`, `Status: ${statusUi(b).label}`, `From: ${b.pickup_address}`];
+  if (b.dropoff_address && b.dropoff_address !== b.pickup_address) lines.push(`To: ${b.dropoff_address}`);
+  return lines.join('\n');
+}
+
+
 // ═══ 3. PRESENTATIONAL COMPONENTS ═══
+
 
 function Card({ children, className = '', label }: { children: ReactNode; className?: string; label?: string }) {
   return (
@@ -297,6 +389,7 @@ function Card({ children, className = '', label }: { children: ReactNode; classN
     </section>
   );
 }
+
 
 function Field({ label, id, children }: { label: string; id: string; children: ReactNode }) {
   return (
@@ -308,6 +401,7 @@ function Field({ label, id, children }: { label: string; id: string; children: R
     </div>
   );
 }
+
 
 function OptionButton({ on, label, desc, onClick }: { on: boolean; label: string; desc: string; onClick: () => void }) {
   return (
@@ -322,6 +416,7 @@ function OptionButton({ on, label, desc, onClick }: { on: boolean; label: string
     </button>
   );
 }
+
 
 /** One row of the pickup -> stops -> destination card. The dot is pinned to the input line, not the row centre. */
 function TripRow({ kind, first, last, children }: { kind: 'pickup' | 'stop' | 'dest'; first: boolean; last: boolean; children: ReactNode }) {
@@ -339,6 +434,7 @@ function TripRow({ kind, first, last, children }: { kind: 'pickup' | 'stop' | 'd
   );
 }
 
+
 interface PriceCardProps {
   live: LiveQuote | null;
   quoting: boolean;
@@ -347,15 +443,18 @@ interface PriceCardProps {
   onRetry: () => void;
 }
 
+
 /** The price-lock card. Owns its own 1 s ticker so the rest of the page does not re-render every second. */
 function PriceCard({ live, quoting, hasInput, error, onRetry }: PriceCardProps) {
   const left = useCountdown(live?.expiresAtMs);
   const q = live?.quote ?? null;
   const surgeReason = q ? SURGE_REASON_LABELS[q.surge.reason] : '';
 
+
   return (
     <section aria-label="Your price" aria-live="polite" className="min-h-[7.5rem] rounded-2xl border-2 border-[#F5B82E] bg-white p-4">
       {!hasInput && !error && <p className="text-sm text-gray-500">Add your addresses and your exact price appears here.</p>}
+
 
       {hasInput && quoting && !q && !error && (
         <div className="space-y-2" aria-label="Getting your price">
@@ -363,6 +462,7 @@ function PriceCard({ live, quoting, hasInput, error, onRetry }: PriceCardProps) 
           <div className="h-5 w-full animate-pulse rounded-lg bg-gray-100" />
         </div>
       )}
+
 
       {error && (
         <div className="flex items-center gap-3 rounded-xl bg-red-50 p-3" role="alert">
@@ -372,6 +472,7 @@ function PriceCard({ live, quoting, hasInput, error, onRetry }: PriceCardProps) 
           </button>
         </div>
       )}
+
 
       {live && q && !error && (
         <div className="space-y-3">
@@ -402,13 +503,16 @@ function PriceCard({ live, quoting, hasInput, error, onRetry }: PriceCardProps) 
             {quoting ? 'Refreshing your price…' : `Locked for you for ${mmss(left)}. If it runs out we refresh it automatically.`}
           </p>
 
+
           {q.surge.active && q.surge.multiplier > 1 && (
             <p className="rounded-xl bg-amber-50 px-3 py-2 text-xs text-amber-900">
               {surgeReason ? `${surgeReason}: ` : ''}fares are ×{q.surge.multiplier.toFixed(1)} right now. This is already included in your price.
             </p>
           )}
 
+
           {q.distance_km > 0 && <p className="text-xs text-gray-500">{q.distance_km.toFixed(1)} km</p>}
+
 
           <ul className="space-y-1.5 text-sm">
             {priceLines(q.breakdown).map((l) => (
@@ -427,6 +531,7 @@ function PriceCard({ live, quoting, hasInput, error, onRetry }: PriceCardProps) 
   );
 }
 
+
 function LockedTotal({ live, quoting, name }: { live: LiveQuote; quoting: boolean; name: string }) {
   const left = useCountdown(live.expiresAtMs);
   const discount = live.quote.breakdown.discount;
@@ -442,7 +547,28 @@ function LockedTotal({ live, quoting, name }: { live: LiveQuote; quoting: boolea
   );
 }
 
+
+function ShieldIcon({ className = 'h-5 w-5' }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M12 3 5 6v5c0 4.5 3 8.3 7 10 4-1.7 7-5.500 7-10V6l-7-3z" />
+      <path d="m9 12 2 2 4-4" />
+    </svg>
+  );
+}
+
+
+function SwapIcon({ className = 'h-4 w-4' }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M7 4v14M7 18l-3-3M7 18l3-3M17 20V6M17 6l-3 3M17 6l3 3" />
+    </svg>
+  );
+}
+
+
 // ═══ 4. UI SECTIONS ═══
+
 
 function ParcelDetails({ value, onChange }: { value: ParcelDraft; onChange: (patch: Partial<ParcelDraft>) => void }) {
   return (
@@ -477,6 +603,7 @@ function ParcelDetails({ value, onChange }: { value: ParcelDraft; onChange: (pat
   );
 }
 
+
 function WasteDetails({ value, onChange }: { value: WasteDraft; onChange: (patch: Partial<WasteDraft>) => void }) {
   return (
     <Card>
@@ -493,12 +620,14 @@ function WasteDetails({ value, onChange }: { value: WasteDraft; onChange: (patch
   );
 }
 
+
 interface RidersCardProps {
   riders: NearbyRider[] | null;
   nearest: NearbyRider | null;
   error: boolean;
   cfg: ServiceView;
 }
+
 
 function RidersNearbyCard({ riders, nearest, error, cfg }: RidersCardProps) {
   const headline =
@@ -510,6 +639,7 @@ function RidersNearbyCard({ riders, nearest, error, cfg }: RidersCardProps) {
         ? `${riders.length} ${riders.length === 1 ? cfg.provider : cfg.providers} near your ${cfg.pickupLabel.toLowerCase()}`
         : `No ${cfg.providers} online nearby right now`;
 
+
   const detail =
     riders && nearest
       ? `Nearest is about ${etaMinutes(nearest.distance_km)} min away. Only ${cfg.providers} approved for ${cfg.name.toLowerCase()} are shown.`
@@ -518,6 +648,7 @@ function RidersNearbyCard({ riders, nearest, error, cfg }: RidersCardProps) {
         : error
           ? 'You can still book. We match you automatically.'
           : '';
+
 
   return (
     <Card label="Riders nearby">
@@ -551,6 +682,7 @@ function RidersNearbyCard({ riders, nearest, error, cfg }: RidersCardProps) {
   );
 }
 
+
 interface PromoCardProps {
   promo: string;
   input: string;
@@ -562,6 +694,7 @@ interface PromoCardProps {
   onApply: () => void;
   onRemove: () => void;
 }
+
 
 function PromoCard({ promo, input, error, discount, quoting, onInputChange, onApply, onRemove }: PromoCardProps) {
   return (
@@ -575,6 +708,7 @@ function PromoCard({ promo, input, error, discount, quoting, onInputChange, onAp
           <p className="text-[11px] text-gray-600">Got a code or a friend’s invite? Save on your booking.</p>
         </div>
       </div>
+
 
       {promo ? (
         <div className="flex items-center gap-3 rounded-xl border border-green-200 bg-white px-3 py-2.5">
@@ -609,6 +743,7 @@ function PromoCard({ promo, input, error, discount, quoting, onInputChange, onAp
         </div>
       )}
 
+
       {error && (
         <p className="mt-2 text-xs text-red-700" role="alert">
           {error}
@@ -617,6 +752,7 @@ function PromoCard({ promo, input, error, discount, quoting, onInputChange, onAp
     </section>
   );
 }
+
 
 function InviteBanner({ reward, onOpen }: { reward: number; onOpen: () => void }) {
   return (
@@ -637,6 +773,7 @@ function InviteBanner({ reward, onOpen }: { reward: number; onOpen: () => void }
   );
 }
 
+
 interface InviteSheetProps {
   open: boolean;
   reward: number;
@@ -645,6 +782,7 @@ interface InviteSheetProps {
   onCopy: () => void;
   onShare: () => void;
 }
+
 
 function InviteSheet({ open, reward, referral, onClose, onCopy, onShare }: InviteSheetProps) {
   return (
@@ -678,22 +816,135 @@ function InviteSheet({ open, reward, referral, onClose, onCopy, onShare }: Invit
   );
 }
 
+
+interface SafetySheetProps {
+  open: boolean;
+  active: Booking | null;
+  onClose: () => void;
+  onShareTrip: () => void;
+}
+
+
+/** Safety & help: emergency numbers, trip sharing and support. Always one tap away from the home screen. */
+function SafetySheet({ open, active, onClose, onShareTrip }: SafetySheetProps) {
+  const riderPhone = active ? riderPhoneOf(active) : '';
+  return (
+    <Sheet open={open} onClose={onClose} label="Safety and help">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-lg font-extrabold text-gray-900">Safety & help</h3>
+          <p className="mt-1 text-sm text-gray-600">Quick access to emergency services and the Rydnow team.</p>
+        </div>
+        <button onClick={onClose} aria-label="Close" className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-gray-100 text-gray-600">
+          <Icon name="close" className="h-4 w-4" />
+        </button>
+      </div>
+
+
+      <div className="mt-4 grid grid-cols-2 gap-2">
+        {EMERGENCY.map((e) => (
+          <a
+            key={e.number}
+            href={`tel:${e.number}`}
+            className="flex items-center gap-3 rounded-xl border border-red-100 bg-red-50 p-3 active:bg-red-100"
+          >
+            <span className="text-xl" aria-hidden>
+              {e.icon}
+            </span>
+            <span className="min-w-0">
+              <span className="block text-base font-extrabold text-red-700">{e.number}</span>
+              <span className="block truncate text-[11px] text-red-900/80">{e.label}</span>
+            </span>
+          </a>
+        ))}
+      </div>
+
+
+      <div className="mt-4 space-y-2">
+        <button
+          onClick={onShareTrip}
+          disabled={!active}
+          className="flex w-full items-center gap-3 rounded-xl border border-gray-200 bg-white p-3 text-left disabled:opacity-50"
+        >
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-blue-50 text-[#1E3FCE]">
+            <Icon name="share" className="h-4 w-4" />
+          </span>
+          <span className="min-w-0">
+            <span className="block text-sm font-bold text-gray-900">Share my trip</span>
+            <span className="block text-xs text-gray-500">{active ? 'Send your trip details to someone you trust' : 'Available while you have an active booking'}</span>
+          </span>
+        </button>
+
+
+        {riderPhone && (
+          <a href={`tel:${riderPhone}`} className="flex items-center gap-3 rounded-xl border border-gray-200 bg-white p-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-green-50 text-lg">📞</span>
+            <span className="min-w-0">
+              <span className="block text-sm font-bold text-gray-900">Call my {active && normalizeServiceKey(active.service_key) === 'waste-bin' ? 'collector' : 'rider'}</span>
+              <span className="block text-xs text-gray-500">{riderPhone}</span>
+            </span>
+          </a>
+        )}
+
+
+        <a href={SUPPORT.phoneHref} className="flex items-center gap-3 rounded-xl border border-gray-200 bg-white p-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-amber-50 text-lg">☎️</span>
+          <span className="min-w-0">
+            <span className="block text-sm font-bold text-gray-900">Call Rydnow support</span>
+            <span className="block text-xs text-gray-500">{SUPPORT.phoneLabel}</span>
+          </span>
+        </a>
+
+
+        <a href={SUPPORT.whatsappHref} target="_blank" rel="noopener noreferrer" className="flex items-center gap-3 rounded-xl border border-gray-200 bg-white p-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-green-50 text-lg">💬</span>
+          <span className="min-w-0">
+            <span className="block text-sm font-bold text-gray-900">Chat on WhatsApp</span>
+            <span className="block text-xs text-gray-500">Fast help with a booking or payment</span>
+          </span>
+        </a>
+
+
+        <a href={`mailto:${SUPPORT.email}`} className="flex items-center gap-3 rounded-xl border border-gray-200 bg-white p-3">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-gray-100 text-lg">✉️</span>
+          <span className="min-w-0">
+            <span className="block text-sm font-bold text-gray-900">Email us</span>
+            <span className="block truncate text-xs text-gray-500">{SUPPORT.email}</span>
+          </span>
+        </a>
+      </div>
+
+
+      <ul className="mt-4 space-y-1.5 rounded-xl bg-gray-50 p-3 text-xs text-gray-600">
+        <li>✓ Check the rider’s name and photo before you start.</li>
+        <li>✓ Wear a helmet and never ride with more than one passenger.</li>
+        <li>✓ Share your trip with a friend for late-night rides.</li>
+      </ul>
+    </Sheet>
+  );
+}
+
+
 // ═══ 5. DATA HOOKS ═══
+
 
 interface ToastState {
   message: string;
   type: ToastType;
 }
 
+
 function useToast() {
   const [toast, setToast] = useState<ToastState | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
 
   const notify = useCallback((message: string, type: ToastType = 'info', duration = 3500) => {
     if (timer.current) clearTimeout(timer.current);
     setToast({ message, type });
     timer.current = setTimeout(() => setToast(null), duration);
   }, []);
+
 
   useEffect(
     () => () => {
@@ -702,8 +953,27 @@ function useToast() {
     [],
   );
 
+
   return { toast, notify };
 }
+
+
+/** True while the browser has no connection. */
+function useOffline() {
+  const [offline, setOffline] = useState(false);
+  useEffect(() => {
+    const update = () => setOffline(!navigator.onLine);
+    update();
+    window.addEventListener('online', update);
+    window.addEventListener('offline', update);
+    return () => {
+      window.removeEventListener('online', update);
+      window.removeEventListener('offline', update);
+    };
+  }, []);
+  return offline;
+}
+
 
 interface QuoteOptions {
   /** null while the form is incomplete. Must be memoised by the caller. */
@@ -714,6 +984,7 @@ interface QuoteOptions {
   onUnauthorized: () => void;
   onPromoRejected: (message: string) => void;
 }
+
 
 /**
  * Fetches a signed, price-locked quote from the backend and refreshes it when the lock expires.
@@ -726,15 +997,18 @@ function useQuote({ input, paused, onUnauthorized, onPromoRejected }: QuoteOptio
   const [priceChanged, setPriceChanged] = useState('');
   const [tick, setTick] = useState(0);
 
+
   const requestId = useRef(0);
   const lastTotal = useRef<number | null>(null);
   const autoRefresh = useRef(false); // true only when WE re-requested an expired quote
+
 
   /** `auto` = true when the app (not the customer) asked, so we can tell them if the price moved. */
   const refresh = useCallback((auto = false) => {
     autoRefresh.current = auto;
     setTick((n) => n + 1);
   }, []);
+
 
   const reset = useCallback(() => {
     setLive(null);
@@ -743,7 +1017,9 @@ function useQuote({ input, paused, onUnauthorized, onPromoRejected }: QuoteOptio
     lastTotal.current = null;
   }, []);
 
+
   const clearPriceChanged = useCallback(() => setPriceChanged(''), []);
+
 
   useEffect(() => {
     if (!input) {
@@ -753,22 +1029,26 @@ function useQuote({ input, paused, onUnauthorized, onPromoRejected }: QuoteOptio
       return;
     }
 
+
     const id = ++requestId.current;
     const ctrl = new AbortController();
     setQuoting(true);
     setError('');
     if (!autoRefresh.current) setPriceChanged('');
 
+
     const timer = setTimeout(async () => {
       try {
         const q = await api.booking.quote(input, { signal: ctrl.signal });
         if (id !== requestId.current) return;
+
 
         if (autoRefresh.current && lastTotal.current !== null && Math.abs(lastTotal.current - q.total_price) >= 0.01) {
           setPriceChanged(`Your price was refreshed: ${money(lastTotal.current)} is now ${money(q.total_price)}.`);
         }
         autoRefresh.current = false;
         lastTotal.current = q.total_price;
+
 
         if (input.promoCode && q.breakdown.discount <= 0) onPromoRejected('This code can’t be applied to this trip.');
         setLive(toLiveQuote(q));
@@ -786,11 +1066,13 @@ function useQuote({ input, paused, onUnauthorized, onPromoRejected }: QuoteOptio
       }
     }, QUOTE_DEBOUNCE_MS);
 
+
     return () => {
       clearTimeout(timer);
       ctrl.abort();
     };
   }, [input, tick, onUnauthorized, onPromoRejected]);
+
 
   // Ask for a fresh price the moment the lock runs out.
   useEffect(() => {
@@ -799,8 +1081,10 @@ function useQuote({ input, paused, onUnauthorized, onPromoRejected }: QuoteOptio
     return () => clearTimeout(timer);
   }, [live, input, paused, refresh]);
 
+
   return { live, quoting, error, priceChanged, refresh, reset, clearPriceChanged };
 }
+
 
 /** Polls riders near `origin` for the chosen service. `riders === null` means "still loading". */
 function useNearbyRiders(origin: { lat: number; lng: number } | null, service: ServiceKey) {
@@ -809,16 +1093,19 @@ function useNearbyRiders(origin: { lat: number; lng: number } | null, service: S
   const [riders, setRiders] = useState<NearbyRider[] | null>(null);
   const [error, setError] = useState(false);
 
+
   useEffect(() => {
     if (lat === undefined || lng === undefined) {
       setRiders(null);
       return;
     }
 
+
     let alive = true;
     const ctrl = new AbortController();
     setRiders(null);
     setError(false);
+
 
     const load = async () => {
       try {
@@ -831,6 +1118,7 @@ function useNearbyRiders(origin: { lat: number; lng: number } | null, service: S
       }
     };
 
+
     load();
     const interval = setInterval(load, NEARBY_POLL_MS);
     return () => {
@@ -840,18 +1128,22 @@ function useNearbyRiders(origin: { lat: number; lng: number } | null, service: S
     };
   }, [lat, lng, service]);
 
+
   const mapRiders = useMemo<MapRider[]>(
     () => (riders ?? []).map((r) => ({ id: r.id, lat: r.latitude, lng: r.longitude })),
     [riders],
   );
+
 
   const nearest = useMemo(
     () => (riders && riders.length ? [...riders].sort((a, b) => a.distance_km - b.distance_km)[0] : null),
     [riders],
   );
 
+
   return { riders, error, mapRiders, nearest };
 }
+
 
 /**
  * Loads the customer's bookings and polls while one is in progress. `onUnauthorized` must be stable.
@@ -863,6 +1155,7 @@ function useBookings(onUnauthorized: () => void) {
   const [bookings, setBookings] = useState<Booking[]>([]);
   const [loading, setLoading] = useState(true);
   const finished = useRef(new Map<string, Booking>());
+
 
   const reload = useCallback(async () => {
     try {
@@ -889,12 +1182,15 @@ function useBookings(onUnauthorized: () => void) {
     }
   }, [onUnauthorized]);
 
+
   useEffect(() => {
     reload();
   }, [reload]);
 
+
   const active = useMemo(() => bookings.find(isActive) ?? null, [bookings]);
   const hasActive = active !== null;
+
 
   useEffect(() => {
     if (!hasActive) return;
@@ -904,10 +1200,13 @@ function useBookings(onUnauthorized: () => void) {
     return () => clearInterval(id);
   }, [hasActive, reload]);
 
+
   return { bookings, loading, active, hasActive, reload };
 }
 
+
 // ═══ 6. CUSTOMER DASHBOARD ═══
+
 
 const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: 'home', label: 'Home', icon: 'home' },
@@ -915,25 +1214,30 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: 'account', label: 'Account', icon: 'user' },
 ];
 
+
 export default function CustomerDashboard() {
   useLockPageScroll();
   const router = useRouter();
   const { profile, update: updateProfile } = useProfile();
   const places = usePlaces();
   const { toast, notify } = useToast();
+  const offline = useOffline();
   const scrollRef = useRef<HTMLElement>(null);
+
 
   // ---- navigation / ui ----
   const [tab, setTab] = useState<Tab>('home');
   const [greeting, setGreeting] = useState('Hello');
   const [payOpen, setPayOpen] = useState(false);
   const [inviteOpen, setInviteOpen] = useState(false);
+  const [safetyOpen, setSafetyOpen] = useState(false);
   const [confirmDialog, setConfirmDialog] = useState<ConfirmState | null>(null);
   const [editingSaved, setEditingSaved] = useState<SavedPlaceId | null>(null);
   const [activityFilter, setActivityFilter] = useState<'active' | 'history'>('active');
   const [userLoc, setUserLoc] = useState<LatLng | null>(null);
   const [locating, setLocating] = useState(false);
   const [referral, setReferral] = useState('RYD-GUEST');
+
 
   // ---- trip form ----
   const [service, setService] = useState<ServiceKey>('okada');
@@ -950,10 +1254,12 @@ export default function CustomerDashboard() {
   const [promoError, setPromoError] = useState('');
   const [payment, setPayment] = useState<PaymentMethod | null>(null);
 
+
   // ---- submit state ----
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
   const [needsSignIn, setNeedsSignIn] = useState(false);
+
 
   /**
    * Wording + backend limits for the selected service. `service` always holds a valid key
@@ -961,27 +1267,32 @@ export default function CustomerDashboard() {
    */
   const cfg = useMemo<ServiceView>(() => ({ ...SERVICE_UI[service], ...SERVICE_HINTS[service] }), [service]);
 
+
   // ─── auth ───
   const signOut = useCallback(() => {
     clearSession();
     router.replace('/login');
   }, [router]);
 
+
   useEffect(() => {
-    if (!getToken()) router.replace('/login');
+    if (!getAuthToken()) router.replace('/login');
   }, [router]);
+
 
   useEffect(() => {
     setGreeting(greetingFor());
-    const u = readJSON<Record<string, unknown>>('currentUser', {});
+    const u = readStoredUser();
     const code = typeof u.referral_code === 'string' ? u.referral_code : '';
     const seed = String(u.email || u.phone || u.username || u.full_name || 'guest');
     setReferral(code || makeReferralCode(seed));
   }, []);
 
+
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
   }, [tab]);
+
 
   // ─── location ───
   const locate = useCallback(
@@ -1004,6 +1315,7 @@ export default function CustomerDashboard() {
     [notify],
   );
 
+
   // If the customer already allowed location, pick it up automatically.
   useEffect(() => {
     if (typeof navigator === 'undefined' || !navigator.permissions?.query) return;
@@ -1013,9 +1325,11 @@ export default function CustomerDashboard() {
       .catch(() => undefined);
   }, [locate]);
 
+
   // ─── quote ───
   const sameSpot = cfg.requiresDestination && !!pickup && !!dropoff && pickup.lat === dropoff.lat && pickup.lng === dropoff.lng;
   const stopPlaces = useMemo(() => stops.map((s) => s.place).filter((p): p is Place => !!p), [stops]);
+
 
   /**
    * The ONE trip description. The quote and the booking are both built from it, because the
@@ -1035,10 +1349,12 @@ export default function CustomerDashboard() {
     };
   }, [service, pickup, dropoff, stops, promo, cfg.requiresDestination, sameSpot]);
 
+
   const rejectPromo = useCallback((message: string) => {
     setPromo('');
     setPromoError(message);
   }, []);
+
 
   const {
     live,
@@ -1050,9 +1366,11 @@ export default function CustomerDashboard() {
     clearPriceChanged,
   } = useQuote({ input: trip, paused: submitting, onUnauthorized: signOut, onPromoRejected: rejectPromo });
 
+
   // ─── riders, route, bookings ───
   const riderOrigin = pickup ?? userLoc;
   const { riders, error: ridersError, mapRiders, nearest } = useNearbyRiders(riderOrigin, service);
+
 
   const routePoints = useMemo<LatLng[]>(
     () => (pickup && dropoff && cfg.requiresDestination ? [pickup, ...stopPlaces, dropoff] : []),
@@ -1061,7 +1379,9 @@ export default function CustomerDashboard() {
   const routeCoords = useRouteLine(routePoints);
   const mapCenter = pickup ?? userLoc ?? DEFAULT_CENTER;
 
+
   const { bookings, loading: loadingBookings, active: activeBooking, hasActive, reload: loadBookings } = useBookings(signOut);
+
 
   // ─── service / stops ───
   function chooseService(next: ServiceKey) {
@@ -1075,10 +1395,16 @@ export default function CustomerDashboard() {
   const removeStop = (id: string) => setStops((s) => s.filter((x) => x.id !== id));
   const patchParcel = (patch: Partial<ParcelDraft>) => setParcel((p) => ({ ...p, ...patch }));
   const patchWaste = (patch: Partial<WasteDraft>) => setWaste((w) => ({ ...w, ...patch }));
+  const swapPlaces = () => {
+    setPickup(dropoff);
+    setDropoff(pickup);
+  };
+
 
   // ─── what still blocks the Book button ───
   const minLater = useMemo(() => localInputValue(new Date(Date.now() + MIN_SCHEDULE_LEAD_MS)), [when]); // eslint-disable-line react-hooks/exhaustive-deps
   const blocker = (() => {
+    if (offline) return 'You’re offline. Reconnect to book';
     if (!pickup) return `Add your ${cfg.pickupLabel.toLowerCase()}`;
     if (cfg.requiresDestination && !dropoff) return `Add your ${cfg.dropoffLabel.toLowerCase()}`;
     if (sameSpot) return 'Pickup and drop-off are the same place';
@@ -1092,8 +1418,10 @@ export default function CustomerDashboard() {
     return '';
   })();
 
+
   const totalLabel = live ? money(live.quote.total_price) : '';
   const ctaLabel = blocker || `Book ${cfg.name} · ${totalLabel}`;
+
 
   function composeNotes() {
     const parts: string[] = [];
@@ -1109,6 +1437,7 @@ export default function CustomerDashboard() {
     if (notes.trim()) parts.push(notes.trim());
     return parts.join('\n').slice(0, 1000);
   }
+
 
   function resetForm() {
     setPickup(null);
@@ -1126,10 +1455,12 @@ export default function CustomerDashboard() {
     resetQuote();
   }
 
+
   // ─── create the booking ───
   async function confirm() {
     if (blocker || !live || !trip || submitting) return;
     if (!payment) return setSubmitError('Choose how you want to pay.');
+
 
     const quoteToken = live.quote.quote_token;
     if (!quoteToken) {
@@ -1137,6 +1468,7 @@ export default function CustomerDashboard() {
       setNeedsSignIn(true);
       return;
     }
+
 
     setSubmitting(true);
     setSubmitError('');
@@ -1157,6 +1489,7 @@ export default function CustomerDashboard() {
       );
       if (cfg.requiresDestination && dropoff) places.remember(dropoff);
 
+
       if (ONLINE_PAYMENT_METHODS.includes(payment)) {
         // Mobile Money and card are paid on the hosted Paystack page before dispatch.
         const init = await api.payments.initialize({ purpose: 'booking', booking_ref: booking.reference });
@@ -1169,6 +1502,7 @@ export default function CustomerDashboard() {
         window.location.assign(url);
         return;
       }
+
 
       await loadBookings();
       setPayOpen(false);
@@ -1191,6 +1525,7 @@ export default function CustomerDashboard() {
     }
   }
 
+
   // ─── cancel / rebook / logout ───
   function askCancel(b: Booking) {
     setConfirmDialog({
@@ -1210,6 +1545,7 @@ export default function CustomerDashboard() {
       },
     });
   }
+
 
   async function rebook(b: Booking) {
     const key = normalizeServiceKey(b.service_key) ?? normalizeServiceKey(b.service_type) ?? 'okada';
@@ -1234,6 +1570,7 @@ export default function CustomerDashboard() {
     notify('Trip details filled in. Check them and continue.', 'info');
   }
 
+
   function handleLogout() {
     setConfirmDialog({
       title: 'Log out of Rydnow?',
@@ -1248,10 +1585,12 @@ export default function CustomerDashboard() {
     });
   }
 
+
   // ─── invite ───
   const inviteLink = () => `${typeof window !== 'undefined' ? window.location.origin : ''}${REFERRAL_PATH}?ref=${referral}`;
   const inviteMessage = () =>
     `Ride, send parcels and book pickups with Rydnow. Use my code ${referral} to get GH₵${REFERRAL_REWARD} off your first booking: ${inviteLink()}`;
+
 
   const copyCode = async () => {
     try {
@@ -1261,6 +1600,7 @@ export default function CustomerDashboard() {
       notify(`Your code is ${referral}`, 'info');
     }
   };
+
 
   const shareInvite = async () => {
     if (typeof navigator !== 'undefined' && navigator.share) {
@@ -1279,6 +1619,28 @@ export default function CustomerDashboard() {
     }
   };
 
+
+  // ─── share trip (safety) ───
+  const shareTrip = async () => {
+    if (!activeBooking) return;
+    const text = tripShareText(activeBooking);
+    if (typeof navigator !== 'undefined' && navigator.share) {
+      try {
+        await navigator.share({ title: 'My Rydnow trip', text });
+      } catch {
+        /* share sheet closed */
+      }
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      notify('Trip details copied. Paste them to someone you trust.', 'success');
+    } catch {
+      notify('Sharing isn’t available on this device', 'error');
+    }
+  };
+
+
   // ─── promo ───
   const applyPromo = () => {
     const code = promoInput.trim().toUpperCase();
@@ -1287,6 +1649,7 @@ export default function CustomerDashboard() {
     setPromo(code);
     setPromoInput('');
   };
+
 
   // ─── derived display ───
   const firstName = profile.fullName.trim().split(' ')[0];
@@ -1313,6 +1676,7 @@ export default function CustomerDashboard() {
           ? `${riders.length} ${riders.length === 1 ? cfg.provider : cfg.providers} nearby${nearest ? ` · ${etaMinutes(nearest.distance_km)} min` : ''}`
           : `No ${cfg.providers} online nearby`;
 
+
   // ─── HOME ───
   const home = (
     <>
@@ -1329,12 +1693,16 @@ export default function CustomerDashboard() {
           bottomInset={28}
         />
 
+
         <div className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center justify-between px-4 pt-[max(1rem,env(safe-area-inset-top))]">
           <div className="pointer-events-auto flex items-center gap-2 rounded-full bg-white py-2 pl-3 pr-4 shadow-lg">
             <span className="h-2.5 w-2.5 rounded-full bg-[#F5B82E]" />
             <span className="text-sm font-extrabold tracking-wide text-[#1E3FCE]">RYDNOW</span>
           </div>
           <div className="pointer-events-auto flex items-center gap-2">
+            <button onClick={() => setSafetyOpen(true)} aria-label="Safety and help" className="flex h-11 w-11 items-center justify-center rounded-full bg-white text-green-700 shadow-lg">
+              <ShieldIcon />
+            </button>
             <button onClick={() => notify('You’re all caught up. No new notifications.', 'info')} aria-label="Notifications" className="flex h-11 w-11 items-center justify-center rounded-full bg-white text-gray-800 shadow-lg">
               <Icon name="bell" />
             </button>
@@ -1343,6 +1711,7 @@ export default function CustomerDashboard() {
             </button>
           </div>
         </div>
+
 
         <div className="pointer-events-none absolute inset-x-4 bottom-14 z-10 flex items-end justify-between gap-3">
           <div className="pointer-events-auto flex min-w-0 max-w-[calc(100%-3.5rem)] items-center gap-2 rounded-full bg-white px-3 py-2 text-xs font-bold text-gray-900 shadow-lg" aria-live="polite">
@@ -1363,8 +1732,10 @@ export default function CustomerDashboard() {
         </div>
       </div>
 
+
       <div className="relative z-20 -mt-5 space-y-5 rounded-t-3xl bg-gray-50 px-4 pb-8 pt-3">
         <div className="mx-auto h-1 w-10 rounded-full bg-gray-300" />
+
 
         <div>
           <h2 className="text-2xl font-extrabold leading-tight text-gray-900">
@@ -1374,28 +1745,48 @@ export default function CustomerDashboard() {
           <p className="mt-0.5 text-sm text-gray-500">Where would you like to go today?</p>
         </div>
 
+
         {activeBooking && (
-          <button
-            onClick={() => {
-              setActivityFilter('active');
-              setTab('activity');
-            }}
-            className="flex w-full items-center gap-3 rounded-2xl border border-blue-100 bg-white p-4 text-left shadow-md"
-          >
-            <span className="relative flex h-3 w-3 shrink-0">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-500 opacity-60" />
-              <span className="relative inline-flex h-3 w-3 rounded-full bg-blue-600" />
-            </span>
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-sm font-bold text-gray-900">{statusUi(activeBooking).label}</span>
-              <span className="block truncate text-xs text-gray-500">
-                {activeBooking.pickup_address}
-                {activeBooking.dropoff_address && activeBooking.dropoff_address !== activeBooking.pickup_address ? ` → ${activeBooking.dropoff_address}` : ''}
+          <div className="overflow-hidden rounded-2xl border border-blue-100 bg-white shadow-md">
+            <button
+              onClick={() => {
+                setActivityFilter('active');
+                setTab('activity');
+              }}
+              className="flex w-full items-center gap-3 p-4 text-left"
+            >
+              <span className="relative flex h-3 w-3 shrink-0">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-500 opacity-60" />
+                <span className="relative inline-flex h-3 w-3 rounded-full bg-blue-600" />
               </span>
-            </span>
-            <span className="shrink-0 text-sm font-bold text-[#1E3FCE]">Track</span>
-          </button>
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-bold text-gray-900">{statusUi(activeBooking).label}</span>
+                <span className="block truncate text-xs text-gray-500">
+                  {activeBooking.pickup_address}
+                  {activeBooking.dropoff_address && activeBooking.dropoff_address !== activeBooking.pickup_address ? ` → ${activeBooking.dropoff_address}` : ''}
+                </span>
+              </span>
+              <span className="shrink-0 text-sm font-bold text-[#1E3FCE]">Track</span>
+            </button>
+            <div className="grid grid-cols-2 divide-x divide-gray-100 border-t border-gray-100 text-xs font-bold">
+              <button onClick={shareTrip} className="flex items-center justify-center gap-1.5 py-3 text-[#1E3FCE]">
+                <Icon name="share" className="h-4 w-4" />
+                Share trip
+              </button>
+              {riderPhoneOf(activeBooking) ? (
+                <a href={`tel:${riderPhoneOf(activeBooking)}`} className="flex items-center justify-center gap-1.5 py-3 text-green-700">
+                  📞 Call {normalizeServiceKey(activeBooking.service_key) === 'waste-bin' ? 'collector' : 'rider'}
+                </a>
+              ) : (
+                <button onClick={() => setSafetyOpen(true)} className="flex items-center justify-center gap-1.5 py-3 text-green-700">
+                  <ShieldIcon className="h-4 w-4" />
+                  Safety & help
+                </button>
+              )}
+            </div>
+          </div>
         )}
+
 
         {/* Trip card: pickup, extra stops, destination */}
         <Card label="Trip" className="shadow-md">
@@ -1420,6 +1811,7 @@ export default function CustomerDashboard() {
             />
           </TripRow>
 
+
           {stops.map((s, i) => (
             <TripRow key={s.id} kind="stop" first={false} last={false}>
               <PlaceField label={`Extra stop ${i + 1}`} placeholder={`Extra stop ${i + 1}`} value={s.place} onChange={(place) => patchStop(s.id, { place })} />
@@ -1441,24 +1833,35 @@ export default function CustomerDashboard() {
             </TripRow>
           ))}
 
+
           {cfg.requiresDestination && (
             <TripRow kind="dest" first={false} last>
               <PlaceField label={cfg.dropoffLabel} placeholder="Where to?" value={dropoff} onChange={setDropoff} invalid={sameSpot} />
             </TripRow>
           )}
 
+
           {sameSpot && (
             <p className="mt-2 rounded-lg bg-red-50 px-3 py-2 text-xs text-red-700" role="alert">
               Pickup and drop-off are the same place. Choose a different drop-off.
             </p>
           )}
-          {stops.length < cfg.maxStops && (
-            <button type="button" onClick={addStop} className="mt-2 flex items-center gap-1.5 py-2 text-sm font-semibold text-[#1E3FCE]">
-              <Icon name="plus" className="h-4 w-4" />
-              Add a stop ({cfg.maxStops - stops.length} left)
-            </button>
-          )}
+          <div className="mt-2 flex flex-wrap items-center gap-x-4">
+            {stops.length < cfg.maxStops && (
+              <button type="button" onClick={addStop} className="flex items-center gap-1.5 py-2 text-sm font-semibold text-[#1E3FCE]">
+                <Icon name="plus" className="h-4 w-4" />
+                Add a stop ({cfg.maxStops - stops.length} left)
+              </button>
+            )}
+            {cfg.requiresDestination && pickup && dropoff && (
+              <button type="button" onClick={swapPlaces} className="flex items-center gap-1.5 py-2 text-sm font-semibold text-gray-600">
+                <SwapIcon />
+                Swap
+              </button>
+            )}
+          </div>
         </Card>
+
 
         {/* Saved places */}
         <section aria-label="Saved places" className="-mx-4 flex gap-2 overflow-x-auto px-4 pb-1">
@@ -1489,6 +1892,7 @@ export default function CustomerDashboard() {
           })}
         </section>
 
+
         {/* Services */}
         <section>
           <h2 className="mb-3 text-base font-extrabold text-gray-900">Choose a service</h2>
@@ -1511,7 +1915,7 @@ export default function CustomerDashboard() {
                       <Icon name="check" className="h-3 w-3" />
                     </span>
                   )}
-                  <Image src={SERVICE_ICON[key]} alt="" width={44} height={44} className="mb-2 h-11 w-11 object-contain" />
+                  <Image src={SERVICE_ICON_SRC[key]} alt="" width={44} height={44} unoptimized className="mb-2 h-11 w-11 object-contain" />
                   <span className="text-[13px] font-bold leading-tight text-gray-900">{s.name}</span>
                   <span className="mt-0.5 text-[11px] leading-tight text-gray-500">{s.blurb}</span>
                   <span className={`mt-auto min-h-[1.75rem] pt-2 text-xs font-extrabold ${on && live ? 'text-[#1E3FCE]' : 'text-gray-500'}`}>{price}</span>
@@ -1521,9 +1925,11 @@ export default function CustomerDashboard() {
           </div>
         </section>
 
+
         {/* Service details */}
         {service === 'parcel' && <ParcelDetails value={parcel} onChange={patchParcel} />}
         {service === 'waste-bin' && <WasteDetails value={waste} onChange={patchWaste} />}
+
 
         <Card>
           <div className="space-y-4">
@@ -1552,7 +1958,9 @@ export default function CustomerDashboard() {
           </div>
         </Card>
 
+
         {pickup && <RidersNearbyCard riders={riders} nearest={nearest} error={ridersError} cfg={cfg} />}
+
 
         <PromoCard
           promo={promo}
@@ -1571,12 +1979,14 @@ export default function CustomerDashboard() {
           }}
         />
 
+
         <PriceCard live={live} quoting={quoting} hasInput={!!trip} error={quoteError} onRetry={() => refreshQuote(false)} />
         {priceChanged && (
           <p className="rounded-xl bg-amber-50 px-3 py-2 text-sm text-amber-900" role="status">
             {priceChanged}
           </p>
         )}
+
 
         <ul className="space-y-2 px-1 text-xs text-gray-500">
           <li>✓ The price you see is the price you pay.</li>
@@ -1586,7 +1996,23 @@ export default function CustomerDashboard() {
           <li>✓ You’ll see your {cfg.provider}’s name, photo and number as soon as they accept.</li>
         </ul>
 
+
         <InviteBanner reward={REFERRAL_REWARD} onOpen={() => setInviteOpen(true)} />
+
+
+        <button
+          onClick={() => setSafetyOpen(true)}
+          className="flex w-full items-center gap-3 rounded-2xl border border-green-100 bg-white p-4 text-left shadow-sm"
+        >
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-green-50 text-green-700">
+            <ShieldIcon />
+          </span>
+          <span className="min-w-0 flex-1">
+            <span className="block text-sm font-bold text-gray-900">Safety & help</span>
+            <span className="block text-xs text-gray-500">Emergency numbers, trip sharing and support</span>
+          </span>
+        </button>
+
 
         {/* Recent places */}
         {!dropoff && cfg.requiresDestination && places.recent.length > 0 && (
@@ -1608,9 +2034,17 @@ export default function CustomerDashboard() {
     </>
   );
 
+
   return (
     <div className="bg-gray-100 text-gray-900" style={{ height: '100dvh' }}>
       <div className="mx-auto flex h-full w-full max-w-md flex-col overflow-hidden bg-gray-50 shadow-xl">
+        {offline && (
+          <div role="status" className="shrink-0 bg-amber-100 px-4 py-2 text-center text-xs font-bold text-amber-900">
+            You’re offline. Some features are unavailable until you reconnect.
+          </div>
+        )}
+
+
         <main ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden overscroll-contain">
           {tab === 'home' && home}
           {tab === 'activity' && (
@@ -1640,6 +2074,7 @@ export default function CustomerDashboard() {
           )}
         </main>
 
+
         {/* Book button: part of the layout, so it can never cover content or the tab bar */}
         {tab === 'home' && (
           <div className="shrink-0 border-t border-gray-100 bg-white px-4 py-3">
@@ -1656,6 +2091,7 @@ export default function CustomerDashboard() {
             </button>
           </div>
         )}
+
 
         <nav aria-label="Main" className="shrink-0 border-t border-gray-200 bg-white pb-[env(safe-area-inset-bottom)]">
           <div className="grid grid-cols-3">
@@ -1678,6 +2114,7 @@ export default function CustomerDashboard() {
         </nav>
       </div>
 
+
       {/* Pay sheet */}
       <Sheet open={payOpen} onClose={() => setPayOpen(false)} dismissible={!submitting} label="Choose how to pay">
         <div className="mb-3 flex items-center justify-between">
@@ -1686,6 +2123,7 @@ export default function CustomerDashboard() {
             <Icon name="close" className="h-4 w-4" />
           </button>
         </div>
+
 
         {live && (
           <div className="mb-4 rounded-2xl border border-gray-100 bg-gray-50 p-4">
@@ -1698,6 +2136,7 @@ export default function CustomerDashboard() {
             </div>
           </div>
         )}
+
 
         <div className="space-y-2" role="radiogroup" aria-label="Payment method">
           {PAYMENT_METHODS.map((m) => {
@@ -1729,6 +2168,7 @@ export default function CustomerDashboard() {
           })}
         </div>
 
+
         {payment && ONLINE_PAYMENT_METHODS.includes(payment) && (
           <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-gray-700">
             You’ll finish your {PAYMENT_LABEL[payment]} payment on a secure page. Your {cfg.provider} is contacted once it goes through.
@@ -1736,6 +2176,7 @@ export default function CustomerDashboard() {
         )}
         {payment === 'cash' && <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-gray-700">Pay the {cfg.provider} in cash at the end of your trip. Please keep small change ready.</p>}
         {payment === 'wallet' && <p className="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-xs text-gray-700">The amount is taken from your wallet now and refunded if you cancel before a {cfg.provider} accepts.</p>}
+
 
         {submitError && (
           <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
@@ -1748,6 +2189,7 @@ export default function CustomerDashboard() {
           </p>
         )}
 
+
         <button
           onClick={confirm}
           disabled={submitting || !payment || !!blocker}
@@ -1758,9 +2200,15 @@ export default function CustomerDashboard() {
         </button>
       </Sheet>
 
+
       <InviteSheet open={inviteOpen} reward={REFERRAL_REWARD} referral={referral} onClose={() => setInviteOpen(false)} onCopy={copyCode} onShare={shareInvite} />
 
+
+      <SafetySheet open={safetyOpen} active={activeBooking} onClose={() => setSafetyOpen(false)} onShareTrip={shareTrip} />
+
+
       <ConfirmDialog dialog={confirmDialog} onClose={() => setConfirmDialog(null)} />
+
 
       {toast && (
         <div role="status" aria-live="polite" className="pointer-events-none fixed inset-x-0 top-0 z-[70] flex justify-center px-4 pt-[max(1rem,env(safe-area-inset-top))]">
@@ -1772,4 +2220,5 @@ export default function CustomerDashboard() {
     </div>
   );
 }
+
 
